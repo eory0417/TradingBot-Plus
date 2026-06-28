@@ -133,6 +133,8 @@ class TelegramNotifier:
         score: float,
         pnl_usdt: float | None = None,
         news_ko: str = "",
+        balance_free: float | None = None,
+        balance_equity: float | None = None,
     ) -> bool:
         """포지션 청산 알림.
 
@@ -145,6 +147,12 @@ class TelegramNotifier:
             pnl_line = f"<b>손익:</b> {pnl_pct:+.2f}% ({pnl_usdt:+,.2f} USDT)\n"
         else:
             pnl_line = f"<b>손익:</b> {pnl_pct:+.2f}%\n"
+        bal_line = ""
+        if balance_free is not None and balance_equity is not None:
+            bal_line = (
+                f"<b>가용 잔고:</b> {balance_free:,.2f} USDT\n"
+                f"<b>총 평가:</b> {balance_equity:,.2f} USDT\n"
+            )
         text = (
             f"🏁 <b>포지션 청산</b> {result_icon} ({side_label})\n"
             f"<b>코인명:</b> {html.escape(symbol)}\n"
@@ -152,6 +160,7 @@ class TelegramNotifier:
             f"<b>청산가:</b> {exit_price:,.4f}\n"
             f"{pnl_line}"
             f"<b>포지션 금액:</b> {amount_usdt:,.2f} USDT\n"
+            f"{bal_line}"
             f"<b>청산 사유:</b> {html.escape(reason)}\n"
             f"<b>뉴스 점수:</b> {score:+.3f}\n"
             f"<b>뉴스(EN):</b> {html.escape(news or 'N/A')}\n"

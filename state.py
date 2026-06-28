@@ -56,6 +56,28 @@ class PositionView:
 
 
 @dataclass
+class ClosedChartView:
+    """청산 후 차트 오버레이 유지용 스냅샷(다음 진입 전까지)."""
+
+    symbol: str
+    side: str
+    entry_price: float
+    exit_price: float
+    stop_loss: float
+    trailing_stop: float
+    trailing_active: bool
+    entry_news: str
+    entry_news_ko: str
+    entry_score: float
+    opened_at: str
+    opened_at_ms: int
+    closed_at_ms: int
+    news_triggered_at_ms: int = 0
+    exit_type: str = ""
+    pnl_pct: float = 0.0
+
+
+@dataclass
 class NewsView:
     """GUI 표시용 뉴스 항목."""
 
@@ -76,6 +98,7 @@ class BotState:
         self._lock = threading.RLock()
         self._balance: float = 0.0
         self._positions: dict[str, PositionView] = {}
+        self._closed_charts: dict[str, ClosedChartView] = {}
         self._ohlcv: dict[str, list[list[float]]] = {}
         self._news: deque[NewsView] = deque(maxlen=200)
         self._logs: deque[dict] = deque(maxlen=500)
@@ -116,6 +139,30 @@ class BotState:
         with self._lock:
             self._positions.clear()
             self._touch()
+
+    def set_closed_chart(self, snapshot: ClosedChartView) -> None:
+        """청산 직후 차트 오버레이 스냅샷 저장."""
+        with self._lock:
+            self._closed_charts[snapshot.symbol] = snapshot
+            self._touch()
+
+    def get_closed_chart(self, symbol: str) -> ClosedChartView | None:
+        with self._lock:
+            return self._closed_charts.get(symbol)
+
+    def clear_closed_chart(self, symbol: str) -> None:
+        with self._lock:
+            self._closed_charts.pop(symbol, None)
+            self._touch()
+
+    def clear_closed_charts(self) -> None:
+        with self._lock:
+            self._closed_charts.clear()
+            self._touch()
+
+    def symbols_with_closed_chart(self) -> list[str]:
+        with self._lock:
+            return list(self._closed_charts.keys())
 
     def get_positions(self) -> list[PositionView]:
         with self._lock:

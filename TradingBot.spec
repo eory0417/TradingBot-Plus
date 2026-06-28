@@ -26,6 +26,7 @@ LOCAL_MODULES = [
     "telegram_login.py",
     "finbert_paths.py",
     "http_session.py",
+    "bb_breakout.py",
 ]
 
 datas = [

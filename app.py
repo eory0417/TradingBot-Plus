@@ -12,11 +12,13 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 import bot as botmod
 import chart_data
 import finetune
+from bb_breakout import bb_series_for_chart
 from kst_util import KST, TZ_LABEL, format_gui_hms, format_kst, ms_to_kst_pandas, now_kst, series_ms_to_kst_pandas, to_kst
 from config import settings
 from state import STATE as BOT_STATE
@@ -97,7 +99,8 @@ st.markdown(
 )
 
 _NEWS_LOG_HEIGHT = 230
-_CHART_HEIGHT = 210
+_CHART_HEIGHT = 280
+_CHART_POPUP_HEIGHT = 640
 
 # 뉴스 소스 모드 라벨(사이드바 selectbox 표시용).
 NEWS_MODE_LABELS = {
@@ -105,6 +108,8 @@ NEWS_MODE_LABELS = {
     "coinnesskr": "coinness only (텔레그램)",
     "rss_coinnesskr": "RSS + coinness",
     "cryptopanic": "CryptoPanic",
+    "rss_coinnesskr_bb": "RSS + coinness + BB 돌파",
+    "bb_only": "BB 돌파 only",
 }
 _PLOTLY_DARK = dict(
     template="plotly_dark",
@@ -158,7 +163,7 @@ class BotRunner:
 
 
 @st.cache_resource
-def get_runner(_state_api_version: int = 3) -> BotRunner:
+def get_runner(_state_api_version: int = 4) -> BotRunner:
     """봇 실행기 싱글톤. _state_api_version 을 올리면 캐시가 갱신된다."""
     # 프로세스( streamlit run ) 시작 시 이전 세션 잔여 포지션 표시를 제거.
     BOT_STATE.clear_positions()
@@ -260,16 +265,19 @@ def render_sidebar() -> None:
     # 증거금 모드는 항상 isolated 로 고정(선택 UI 제거).
     margin_mode = "isolated"
     manual_leverage = st.sidebar.checkbox(
-        "수동 레버리지", value=not settings.auto_leverage,
-        help="체크: 슬라이더로 직접 설정 · 해제: 뉴스 점수로 자동 설정",
+        "뉴스 수동 레버리지", value=not settings.auto_leverage,
+        help="체크: 뉴스 진입 레버리지 직접 설정 · 해제: 뉴스 점수로 자동 설정",
     )
     auto_leverage = not manual_leverage
     if manual_leverage:
-        leverage = st.sidebar.slider("레버리지", 1, 25, settings.leverage)
+        leverage = st.sidebar.slider(
+            "뉴스 레버리지", 1, 25, settings.leverage,
+            help="뉴스 기반 진입·뉴스 피라미딩에만 적용",
+        )
     else:
         leverage = settings.leverage  # 자동 모드: 진입 시 점수로 결정
         st.sidebar.caption(
-            "자동 레버리지: |점수| 0.7→1x · 0.8→2x · 0.9→3x · 1.0→4x "
+            "뉴스 자동 레버리지: |점수| 0.7→1x · 0.8→2x · 0.9→3x · 1.0→4x "
             "(점수 1.0·역방향이면 2x 진입)"
         )
     notional = st.sidebar.number_input(
@@ -327,6 +335,68 @@ def render_sidebar() -> None:
         settings.news_source_mode = chosen
     if running:
         st.sidebar.caption("뉴스 소스는 실행 중 변경할 수 없습니다 — 정지 후 변경하세요.")
+
+    with st.sidebar.expander("BB 진입 파라미터", expanded=settings.use_bb_entry):
+        bb_disabled = running
+        settings.bb_leverage = int(st.slider(
+            "BB 레버리지",
+            min_value=1,
+            max_value=int(settings.bb_max_add_leverage),
+            value=int(settings.bb_leverage),
+            disabled=bb_disabled,
+            help="볼린저 돌파 최초 진입 전용 (뉴스 레버리지와 별도)",
+        ))
+        settings.bb_len = int(st.number_input(
+            "BB Length", min_value=5, max_value=100, value=int(settings.bb_len),
+            step=1, disabled=bb_disabled,
+        ))
+        settings.bb_mult = float(st.number_input(
+            "BB Mult (Std)", min_value=0.5, max_value=5.0, value=float(settings.bb_mult),
+            step=0.1, disabled=bb_disabled,
+        ))
+        settings.bb_min = float(st.number_input(
+            "BB Min Width %", min_value=0.0, max_value=10.0, value=float(settings.bb_min),
+            step=0.05, disabled=bb_disabled,
+        ))
+        settings.vol_mult = float(st.number_input(
+            "Vol Mult", min_value=0.0, max_value=10.0, value=float(settings.vol_mult),
+            step=0.1, disabled=bb_disabled,
+        ))
+        settings.vol_len = int(st.number_input(
+            "Vol Lookback", min_value=1, max_value=100, value=int(settings.vol_len),
+            step=1, disabled=bb_disabled,
+        ))
+        _trend_modes = ("relaxed", "strict", "off")
+        _trend_labels = {
+            "relaxed": "완화 (50% 동조)",
+            "strict": "엄격 (60% 동조, 명세)",
+            "off": "끔 (순수 돌파)",
+        }
+        cur_trend = settings.bb_trend_mode
+        if cur_trend not in _trend_modes:
+            cur_trend = "relaxed"
+        trend_pick = st.selectbox(
+            "추세 필터",
+            _trend_modes,
+            index=_trend_modes.index(cur_trend),
+            format_func=lambda k: _trend_labels[k],
+            disabled=bb_disabled,
+            help="relaxed: 급격한 돌파 포착 · strict: BBBQ 명세 · off: BB+거래량만",
+        )
+        settings.bb_trend_mode = trend_pick
+        settings.f_trend_len = int(st.number_input(
+            "Trend Len", min_value=0, max_value=50, value=int(settings.f_trend_len),
+            step=1, disabled=bb_disabled,
+            help="추세 필터 끔(off) 또는 0이면 기울기 검사 생략",
+        ))
+        settings.f_trend_pct = float(st.number_input(
+            "Trend Min %", min_value=0.0, max_value=5.0, value=float(settings.f_trend_pct),
+            step=0.05, disabled=bb_disabled,
+        ))
+        settings.min_range_pct = float(st.number_input(
+            "Min Range %", min_value=0.0, max_value=5.0, value=float(settings.min_range_pct),
+            step=0.05, disabled=bb_disabled, help="0이면 비활성",
+        ))
 
     st.sidebar.divider()
     col1, col2 = st.sidebar.columns(2)
@@ -431,7 +501,7 @@ def _same_moment_ms(a_ms: int, b_ms: int, window_ms: int = 60_000) -> bool:
 
 
 def _price_band(ohlcv_df: pd.DataFrame, pos) -> tuple[float, float]:
-    """캔들 + SL/진입/익절을 모두 담는 Y축 범위."""
+    """캔들 + SL/진입/익절/청산을 모두 담는 Y축 범위."""
     y_lo = float(ohlcv_df["low"].min())
     y_hi = float(ohlcv_df["high"].max())
     levels = [y_lo, y_hi]
@@ -439,9 +509,20 @@ def _price_band(ohlcv_df: pd.DataFrame, pos) -> tuple[float, float]:
         levels.extend([pos.stop_loss, pos.entry_price])
         if getattr(pos, "trailing_active", False):
             levels.append(pos.trailing_stop)
+        exit_px = float(getattr(pos, "exit_price", 0) or 0)
+        if exit_px > 0:
+            levels.append(exit_px)
     y_min, y_max = min(levels), max(levels)
     pad = max((y_max - y_min) * 0.06, y_max * 0.0005)
     return y_min - pad, y_max + pad
+
+
+def _chart_overlay(symbol: str):
+    """오픈 포지션 또는 청산 직후 스냅샷(다음 진입 전까지)."""
+    for p in STATE.get_positions():
+        if p.symbol == symbol:
+            return p
+    return STATE.get_closed_chart(symbol)
 
 
 def _add_price_line(
@@ -451,28 +532,43 @@ def _add_price_line(
     label: str,
     color: str,
     dash: str,
-    x_end,
-    y_min: float,
-    y_max: float,
+    row: int = 1,
+    col: int = 1,
 ) -> None:
-    """가격 수평선 + 차트 안쪽에 보이는 라벨."""
-    fig.add_hline(y=y, line_dash=dash, line_color=color, line_width=1.2)
-    # SL/Entry 가 캔들 밖이어도 라벨이 잘리지 않도록 Y 위치를 클램프.
-    label_y = max(y_min, min(y, y_max))
+    """가격 수평선 + 오른쪽 여백 라벨(캔들 영역 가리지 않음)."""
+    fig.add_hline(
+        y=y, line_dash=dash, line_color=color, line_width=1.2, row=row, col=col,
+    )
     fig.add_annotation(
-        x=x_end,
-        y=label_y,
+        xref="x domain",
+        yref="y",
+        x=1.01,
+        y=y,
         text=label,
         showarrow=False,
-        xanchor="right",
-        xshift=-4,
+        xanchor="left",
         yanchor="middle",
-        font=dict(color=color, size=10),
-        bgcolor="rgba(22,27,34,0.88)",
+        font=dict(color=color, size=9),
+        bgcolor="rgba(22,27,34,0.92)",
         bordercolor=color,
         borderwidth=1,
-        borderpad=3,
+        borderpad=2,
+        row=row,
+        col=col,
     )
+
+
+def _extend_y_for_bb(
+    y_min: float, y_max: float, upper: list, lower: list,
+) -> tuple[float, float]:
+    """BB 상·하단이 Y축 범위에 포함되도록 확장한다."""
+    bb_vals = [v for v in upper + lower if v is not None]
+    if not bb_vals:
+        return y_min, y_max
+    pad = max((y_max - y_min) * 0.06, y_max * 0.0005)
+    y_lo = min(y_min, min(bb_vals)) - pad
+    y_hi = max(y_max, max(bb_vals)) + pad
+    return y_lo, y_hi
 
 
 def build_candlestick_figure(
@@ -485,7 +581,7 @@ def build_candlestick_figure(
     timeframe: str = "15m",
     show_legend: bool = False,
 ) -> go.Figure | None:
-    """OHLCV 데이터로 캔들 차트를 그린다. 진입·뉴스 시점 마커를 선택적으로 표시."""
+    """OHLCV + 설정값 BB + 하단 거래량 차트."""
     if not ohlcv:
         return None
     df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -493,48 +589,97 @@ def build_candlestick_figure(
     y_min, y_max = _price_band(df, pos)
     y_lo = float(df["low"].min())
     y_hi = float(df["high"].max())
-    x_end = df["time"].iloc[-1]
 
-    fig = go.Figure(
-        data=[go.Candlestick(
+    upper, basis, lower = bb_series_for_chart(
+        df["close"].tolist(), settings.bb_len, settings.bb_mult,
+    )
+    y_min, y_max = _extend_y_for_bb(y_min, y_max, upper, lower)
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.72, 0.28], vertical_spacing=0.05,
+        subplot_titles=(None, "거래량"),
+    )
+
+    fig.add_trace(
+        go.Candlestick(
             x=df["time"], open=df["open"], high=df["high"],
             low=df["low"], close=df["close"], name=symbol,
             increasing_line_color="#3fb950", decreasing_line_color="#f85149",
-        )]
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["time"], y=upper, name="BB Upper",
+            line=dict(color="#d29922", width=1.2), connectgaps=False,
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["time"], y=basis, name="BB Basis",
+            line=dict(color="#a371f7", width=1, dash="dot"), connectgaps=False,
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["time"], y=lower, name="BB Lower",
+            line=dict(color="#d29922", width=1.2), connectgaps=False,
+        ),
+        row=1, col=1,
+    )
+    vol_colors = [
+        "#3fb950" if c >= o else "#f85149"
+        for c, o in zip(df["close"], df["open"])
+    ]
+    fig.add_trace(
+        go.Bar(
+            x=df["time"], y=df["volume"], name="Volume",
+            marker_color=vol_colors, showlegend=False,
+        ),
+        row=2, col=1,
     )
 
+    pl_kw = dict(row=1, col=1)
+    is_closed = getattr(pos, "closed_at_ms", 0) > 0 if pos is not None else False
     if pos is not None:
+        span = y_max - y_min
         _add_price_line(
             fig, y=pos.stop_loss, label=f"SL {pos.stop_loss:.4f}",
-            color="#f85149", dash="dash", x_end=x_end, y_min=y_min, y_max=y_max,
+            color="#f85149", dash="dash", **pl_kw,
         )
         if getattr(pos, "trailing_active", False):
             _add_price_line(
                 fig, y=pos.trailing_stop, label=f"TP {pos.trailing_stop:.4f}",
-                color="#3fb950", dash="dot", x_end=x_end, y_min=y_min, y_max=y_max,
+                color="#3fb950", dash="dot", **pl_kw,
             )
         _add_price_line(
             fig, y=pos.entry_price, label=f"Entry {pos.entry_price:.4f}",
-            color="#58a6ff", dash="solid", x_end=x_end, y_min=y_min, y_max=y_max,
+            color="#58a6ff", dash="solid", **pl_kw,
         )
-
+        exit_px = float(getattr(pos, "exit_price", 0) or 0)
+        if is_closed and exit_px > 0:
+            _add_price_line(
+                fig, y=exit_px, label=f"Exit {exit_px:.4f}",
+                color="#8b949e", dash="dashdot", **pl_kw,
+            )
         entry_ms = int(getattr(pos, "opened_at_ms", 0) or 0)
         if entry_ms:
             entry_dt = ms_to_kst_pandas(entry_ms)
-            span = y_max - y_min
-            entry_marker_y = y_min + span * 0.05  # 차트 하단 여백 — 캔들과 겹치지 않음
+            entry_marker_y = y_min + span * 0.05
             fig.add_trace(go.Scatter(
                 x=[entry_dt, entry_dt], y=[y_min, y_max], mode="lines",
                 line=dict(color="#d29922", width=1.2, dash="dot"),
                 name="진입시각", hoverinfo="skip", showlegend=show_legend,
-            ))
-            # 진입가까지 얇은 연결선(가격 위치는 파란 Entry 라인으로 확인).
+            ), row=1, col=1)
             fig.add_trace(go.Scatter(
                 x=[entry_dt, entry_dt], y=[entry_marker_y, pos.entry_price],
                 mode="lines",
                 line=dict(color="#d29922", width=1, dash="dot"),
                 hoverinfo="skip", showlegend=False,
-            ))
+            ), row=1, col=1)
             fig.add_trace(go.Scatter(
                 x=[entry_dt], y=[entry_marker_y], mode="markers+text",
                 marker=dict(symbol="star", size=13, color="#d29922",
@@ -544,7 +689,30 @@ def build_candlestick_figure(
                 name="진입", hoverinfo="text",
                 hovertext=[f"진입 {pos.opened_at} ({TZ_LABEL}) @ {pos.entry_price:.4f}"],
                 showlegend=show_legend,
-            ))
+            ), row=1, col=1)
+
+        closed_ms = int(getattr(pos, "closed_at_ms", 0) or 0)
+        if is_closed and closed_ms:
+            closed_dt = ms_to_kst_pandas(closed_ms)
+            exit_marker_y = y_min + span * 0.12
+            fig.add_trace(go.Scatter(
+                x=[closed_dt, closed_dt], y=[y_min, y_max], mode="lines",
+                line=dict(color="#8b949e", width=1.2, dash="dot"),
+                name="청산시각", hoverinfo="skip", showlegend=show_legend,
+            ), row=1, col=1)
+            fig.add_trace(go.Scatter(
+                x=[closed_dt], y=[exit_marker_y], mode="markers+text",
+                marker=dict(symbol="x", size=12, color="#8b949e",
+                            line=dict(color="#ffffff", width=1)),
+                text=["청산"], textposition="bottom center",
+                textfont=dict(color="#8b949e", size=10),
+                name="청산", hoverinfo="text",
+                hovertext=[
+                    f"청산 @ {exit_px:.4f} · {getattr(pos, 'pnl_pct', 0):+.2f}% "
+                    f"({getattr(pos, 'exit_type', '')})"
+                ],
+                showlegend=show_legend,
+            ), row=1, col=1)
 
     entry_ms = int(getattr(pos, "opened_at_ms", 0) or 0) if pos is not None else 0
     span = y_max - y_min
@@ -576,7 +744,7 @@ def build_candlestick_figure(
             x=[news_dt, news_dt], y=[y_min, y_max], mode="lines",
             line=dict(color="#a371f7", width=1.4, dash="dash"),
             name=f"{label}시각", hoverinfo="skip", showlegend=show_legend,
-        ))
+        ), row=1, col=1)
         fig.add_trace(go.Scatter(
             x=[news_dt], y=[marker_y], mode="markers+text",
             marker=dict(symbol="diamond", size=13, color="#a371f7",
@@ -586,10 +754,15 @@ def build_candlestick_figure(
             name=label, hoverinfo="text",
             hovertext=["\n".join(hover_parts)],
             showlegend=show_legend,
-        ))
+        ), row=1, col=1)
 
-    title_text = symbol if timeframe == "15m" else f"{symbol} · {timeframe}"
-    # 1분봉: 5분 간격 시간 라벨 + 세로 눈금선.
+    bb_label = f"BB({settings.bb_len},{settings.bb_mult:g})"
+    closed_tag = " · 청산됨" if is_closed else ""
+    title_text = (
+        f"{symbol} · {bb_label}{closed_tag}"
+        if timeframe == "15m"
+        else f"{symbol} · {timeframe} · {bb_label}{closed_tag}"
+    )
     xaxis_cfg = dict(title=f"시간 ({TZ_LABEL})", showgrid=True)
     layout_shapes: list[dict] = []
     if timeframe == "1m":
@@ -601,18 +774,22 @@ def build_candlestick_figure(
             gridwidth=1,
         )
         layout_shapes = _five_min_vertical_lines(df["time"], y_min, y_max)
-    fig.update_layout(
+    layout_kw = dict(
         height=height,
-        margin=dict(l=4, r=72, t=28, b=4),
-        xaxis_rangeslider_visible=False,
+        margin=dict(l=4, r=98, t=28, b=4),
         title=dict(text=title_text, font=dict(size=11, color="#E6EDF3")),
         showlegend=show_legend,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        yaxis=dict(range=[y_min, y_max], fixedrange=False),
-        xaxis=xaxis_cfg,
         shapes=layout_shapes,
         **_PLOTLY_DARK,
     )
+    fig.update_layout(**layout_kw)
+    fig.update_yaxes(range=[y_min, y_max], fixedrange=False, row=1, col=1)
+    fig.update_xaxes(**xaxis_cfg, row=2, col=1)
+    fig.update_xaxes(rangeslider_visible=False, row=1, col=1)
+    fig.update_yaxes(title_text="거래량", row=2, col=1)
+    for ann in fig.layout.annotations:
+        ann.font = dict(color="#8b949e", size=10)
     fig.update_xaxes(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.06)")
     fig.update_yaxes(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.06)")
     return fig
@@ -620,7 +797,7 @@ def build_candlestick_figure(
 
 def candlestick(symbol: str, height: int = _CHART_HEIGHT) -> go.Figure | None:
     ohlcv = STATE.get_ohlcv(symbol)
-    pos = next((p for p in STATE.get_positions() if p.symbol == symbol), None)
+    pos = _chart_overlay(symbol)
     news_markers = _collect_news_markers(symbol, pos)
     return build_candlestick_figure(
         symbol, ohlcv, height=height, pos=pos, news_markers=news_markers,
@@ -642,7 +819,7 @@ def chart_dialog() -> None:
         st.caption("표시할 심볼이 없습니다.")
         return
 
-    pos = next((p for p in STATE.get_positions() if p.symbol == sym), None)
+    pos = _chart_overlay(sym)
     tf_options = list(chart_data.CHART_TIMEFRAMES)
     tf_key = f"chart_tf_{_sym_key(sym)}"
     default_tf = st.session_state.get(tf_key, "15m")
@@ -675,7 +852,7 @@ def chart_dialog() -> None:
     st.caption(f"◆ 보라(상단) = 뉴스 인식 · ★ 금색(하단) = 진입 · 시간은 {TZ_LABEL}")
 
     fig = build_candlestick_figure(
-        sym, ohlcv, height=620, pos=pos, news_markers=news_markers,
+        sym, ohlcv, height=_CHART_POPUP_HEIGHT, pos=pos, news_markers=news_markers,
         timeframe=tf, show_legend=True,
     )
     if fig is not None:
@@ -854,7 +1031,9 @@ def _log_style(lg: dict) -> tuple[str, str]:
     level = lg.get("level", "INFO")
     if cat == "news":
         return "log-news", '<span class="log-badge badge-news">뉴스</span>'
-    if cat == "entry" and ("진입 " in msg or "추가진입" in msg) and "스킵" not in msg and "보류" not in msg:
+    if cat == "entry" and "BB 진입" in msg:
+        return "log-fail", '<span class="log-badge badge-fail">BB</span>'
+    if cat == "entry" and ("진입 " in msg or "추가진입" in msg) and "스킵" not in msg and "보류" not in msg and "실패" not in msg:
         return "log-entry", '<span class="log-badge badge-entry">진입</span>'
     if cat == "exit":
         loss = "손익=-" in msg
@@ -873,12 +1052,17 @@ def render_dashboard() -> None:
 
     positions = STATE.get_positions()
     bot_label, bot_hint = _bot_status_compact()
+    acct = _account_summary(STATE.get_balance(), positions)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("잔고 (USDT)", f"{STATE.get_balance():,.2f}")
-    c2.metric("포지션", f"{len(positions)} / {settings.max_positions}")
-    c3.metric("상태", STATE.status)
-    with c4:
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("가용 잔고", f"{acct['free']:,.2f}", help="새 진입에 사용 가능한 USDT")
+    c2.metric(
+        "총 평가 잔고", f"{acct['equity']:,.2f}",
+        help=f"가용 + 투입 증거금 {acct['used_margin']:,.2f} + 미실현 {acct['unrealized']:+,.2f}",
+    )
+    c3.metric("포지션", f"{len(positions)} / {settings.max_positions}")
+    c4.metric("상태", STATE.status)
+    with c5:
         st.metric("봇", bot_label)
         st.markdown(f'<p class="bot-status-hint">{bot_hint}</p>', unsafe_allow_html=True)
 
@@ -927,8 +1111,17 @@ def render_dashboard() -> None:
         st.session_state["pending_dialog"] = ("stats", None)
         st.rerun()
     open_syms = [p.symbol for p in positions]
+    closed_syms = STATE.symbols_with_closed_chart()
     data_syms = STATE.symbols_with_data()
-    chart_syms = (open_syms + [s for s in data_syms if s not in open_syms])[:2]
+    seen: set[str] = set()
+    chart_syms: list[str] = []
+    for s in open_syms + closed_syms + data_syms:
+        if s in seen:
+            continue
+        seen.add(s)
+        chart_syms.append(s)
+        if len(chart_syms) >= 2:
+            break
     if chart_syms:
         cols = st.columns(len(chart_syms))
         for col, sym in zip(cols, chart_syms):

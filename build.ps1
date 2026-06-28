@@ -47,7 +47,7 @@ pause
 Write-Host ""
 Write-Host "완료: $dist" -ForegroundColor Green
 Write-Host '  1) dist\TradingBot-Plus\.env.example -> .env 복사 후 API 키 입력'
-Write-Host '  2) coinnesskr: telegram_login.py 로 세션 생성 후 models\*.session 복사'
+Write-Host '  2) coinness: telegram_login.py 로 세션 생성 후 models\*.session 복사'
 Write-Host '  3) 선택: models\hf_cache 복사 시 FinBERT 재다운로드 생략'
 Write-Host '  4) TradingBotPlus.exe 또는 run.bat 실행 - http://localhost:8502'
 Write-Host '  5) 다른 PC: dist\TradingBot-Plus 폴더 전체 ZIP'

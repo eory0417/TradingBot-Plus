@@ -187,12 +187,19 @@ class TradingEngine:
             log.info("Position closed | %s | open_now=%d", symbol, self.position_count)
 
     # ---- 지표 ----
-    async def fetch_ohlcv_df(self, symbol: str, limit: int = 100) -> pd.DataFrame | None:
-        """15분봉 OHLCV를 가져와 데이터프레임으로 반환한다."""
+    async def fetch_ohlcv_df(
+        self,
+        symbol: str,
+        limit: int = 100,
+        *,
+        timeframe: str | None = None,
+    ) -> pd.DataFrame | None:
+        """OHLCV를 가져와 데이터프레임으로 반환한다."""
+        tf = timeframe or self.timeframe
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=self.timeframe, limit=limit)
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
         except Exception as exc:  # noqa: BLE001
-            log_exception(log, exc, context="fetch_ohlcv", symbol=symbol)
+            log_exception(log, exc, context="fetch_ohlcv", symbol=symbol, timeframe=tf)
             return None
         if not ohlcv:
             log.warning("No OHLCV returned | symbol=%s", symbol)

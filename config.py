@@ -80,7 +80,8 @@ class Settings(BaseSettings):
     cryptopanic_api_token: SecretStr = Field(
         default=SecretStr(""), alias="CRYPTOPANIC_API_TOKEN"
     )
-    # 뉴스 소스 모드: rss | coinnesskr | rss_coinnesskr | cryptopanic.
+    # 뉴스 소스 모드: rss | coinnesskr | rss_coinnesskr | cryptopanic |
+    # rss_coinnesskr_bb | bb_only.
     news_source_mode: str = Field(
         default="rss_coinnesskr", alias="NEWS_SOURCE_MODE"
     )
@@ -121,17 +122,33 @@ class Settings(BaseSettings):
     # 고정 손절 비율(%). 진입가 대비 이 비율만큼 불리하게 움직이면 시장가 청산.
     stop_loss_pct: float = Field(default=2.0, alias="STOP_LOSS_PCT")
     # 동적 익절(Trailing Stop) 기본 ATR 배수.
-    trailing_atr_mult: float = Field(default=3.0, alias="TRAILING_ATR_MULT")
+    trailing_atr_mult: float = Field(default=2.5, alias="TRAILING_ATR_MULT")
     # 강한 추세/뉴스 신호 발생 시 적용하는 축소된 ATR 배수(익절 라인을 바짝 당김).
     trailing_atr_mult_tight: float = Field(default=1.5, alias="TRAILING_ATR_MULT_TIGHT")
     # Trailing stop 활성화 최소 이익(%). 이 수익률 이상일 때만 트레일링 익절이 동작한다.
-    trailing_profit_pct: float = Field(default=2.0, alias="TRAILING_PROFIT_PCT")
+    trailing_profit_pct: float = Field(default=1.5, alias="TRAILING_PROFIT_PCT")
     # 실시간 뉴스 가중치 축소 트리거 임계값(긍정 0.7 / 부정 -0.7).
     news_score_threshold: float = Field(default=0.7, alias="NEWS_SCORE_THRESHOLD")
     # 횡보 시 시간 청산까지의 보유 시간(시간 단위).
     time_exit_hours: float = Field(default=7.0, alias="TIME_EXIT_HOURS")
     # 포지션 모니터링 주기(초).
     monitor_interval: int = Field(default=15, alias="MONITOR_INTERVAL")
+
+    # ---- 볼린저 밴드 돌파 진입 (BBBQ) ----
+    bb_len: int = Field(default=20, alias="BB_LEN")
+    bb_mult: float = Field(default=2.0, alias="BB_MULT")
+    bb_min: float = Field(default=1.0, alias="BB_MIN")
+    vol_mult: float = Field(default=1.5, alias="VOL_MULT")
+    vol_len: int = Field(default=20, alias="VOL_LEN")
+    f_trend_len: int = Field(default=5, alias="F_TREND_LEN")
+    f_trend_pct: float = Field(default=0.25, alias="F_TREND_PCT")
+    min_range_pct: float = Field(default=0.08, alias="MIN_RANGE_PCT")
+    # BB 추세 필터: off(비활성) | relaxed(완화, 50% 동조) | strict(명세, 60% 동조).
+    bb_trend_mode: str = Field(default="relaxed", alias="BB_TREND_MODE")
+    # BB 최초 진입 레버리지(뉴스 LEVERAGE/AUTO_LEVERAGE 와 별도).
+    bb_leverage: int = Field(default=2, alias="BB_LEVERAGE")
+    # BB 추가 진입(피라미딩) 시 레버리지 상한.
+    bb_max_add_leverage: int = Field(default=10, alias="BB_MAX_ADD_LEVERAGE")
 
     # ---- FinBERT 주기적 파인튜닝(재학습) ----
     # 자동 재학습 활성화 여부.
@@ -209,11 +226,22 @@ class Settings(BaseSettings):
             raise ValueError("MARGIN_MODE must be 'isolated' or 'cross'")
         return normalized
 
+    @field_validator("bb_trend_mode")
+    @classmethod
+    def _validate_bb_trend_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"off", "relaxed", "strict"}:
+            raise ValueError("BB_TREND_MODE must be 'off', 'relaxed', or 'strict'")
+        return normalized
+
     @field_validator("news_source_mode")
     @classmethod
     def _validate_news_source_mode(cls, value: str) -> str:
         normalized = value.strip().lower()
-        valid = {"rss", "coinnesskr", "rss_coinnesskr", "cryptopanic"}
+        valid = {
+            "rss", "coinnesskr", "rss_coinnesskr", "cryptopanic",
+            "rss_coinnesskr_bb", "bb_only",
+        }
         if normalized not in valid:
             raise ValueError(
                 f"NEWS_SOURCE_MODE must be one of {sorted(valid)}, got {value!r}"
@@ -241,17 +269,38 @@ class Settings(BaseSettings):
     @property
     def use_rss(self) -> bool:
         """현재 모드에서 RSS 폴링을 사용하는지 여부."""
-        return self.news_source_mode in {"rss", "rss_coinnesskr"}
+        return self.news_source_mode in {
+            "rss", "rss_coinnesskr", "rss_coinnesskr_bb", "bb_only",
+        }
 
     @property
     def use_coinnesskr(self) -> bool:
         """현재 모드에서 coinnesskr(Telethon) 수신을 사용하는지 여부."""
-        return self.news_source_mode in {"coinnesskr", "rss_coinnesskr"}
+        return self.news_source_mode in {
+            "coinnesskr", "rss_coinnesskr", "rss_coinnesskr_bb", "bb_only",
+        }
 
     @property
     def use_cryptopanic(self) -> bool:
         """현재 모드에서 CryptoPanic API를 사용하는지 여부."""
         return self.news_source_mode == "cryptopanic"
+
+    @property
+    def use_bb_entry(self) -> bool:
+        """BB 돌파 진입 경로 활성 여부."""
+        return self.news_source_mode in {"rss_coinnesskr_bb", "bb_only"}
+
+    @property
+    def use_news_entry(self) -> bool:
+        """뉴스 기반 진입·뉴스 피라미딩 활성 여부."""
+        return self.news_source_mode != "bb_only"
+
+    def bb_trend_filter(self) -> tuple[int, float, float] | None:
+        """BB 추세 필터 파라미터 (len, pct, same_dir_ratio). None이면 비활성."""
+        if self.bb_trend_mode == "off" or self.f_trend_len <= 0:
+            return None
+        same_dir = 0.5 if self.bb_trend_mode == "relaxed" else 0.6
+        return self.f_trend_len, self.f_trend_pct, same_dir
 
     @property
     def telegram_api_hash_value(self) -> str:

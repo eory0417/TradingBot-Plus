@@ -28,10 +28,11 @@ import numpy as np
 import pandas as pd
 
 import finetune
+from bb_breakout import BB_OHLCV_LIMIT, evaluate_bb_entry
 from config import settings
 from logger import format_exception_brief, get_logger, log_exception
 from news_analyzer import AnalyzedNews, NewsAnalyzer
-from state import STATE, NewsView, PositionView
+from state import STATE, NewsView, PositionView, ClosedChartView
 from strategy import ExitSignal, Position, Side
 from kst_util import format_kst
 from trading_engine import TradingEngine, compute_indicators_from_df, RSI_LENGTH, ATR_LENGTH
@@ -95,6 +96,13 @@ SIM_BASE_PRICES: dict[str, float] = {
     "XRP/USDT": 0.60,
 }
 
+BB_FAIL_LABELS: dict[str, str] = {
+    "BB_WIDTH": "밴드 폭 부족(횡보)",
+    "VOLUME": "거래량 부족",
+    "TREND": "추세 필터 미달",
+    "RANGE": "캔들 변동폭 부족",
+}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -140,6 +148,7 @@ class SimMarket:
     def __init__(self, symbols: list[str]) -> None:
         self.balance = 10_000.0
         self._closes: dict[str, deque] = {}
+        self._volumes: dict[str, deque] = {}
         rng = np.random.default_rng(42)
         for sym in symbols:
             base = SIM_BASE_PRICES.get(sym, 100.0)
@@ -147,6 +156,9 @@ class SimMarket:
             drift = rng.normal(0, base * 0.0008, 120).cumsum()
             series = base + drift + rng.normal(0, base * 0.0005, 120)
             self._closes[sym] = deque(series.tolist(), maxlen=400)
+            self._volumes[sym] = deque(
+                rng.uniform(0.5, 3.0, 120).tolist(), maxlen=400,
+            )
         self._rng = rng
 
     def tick(self, symbol: str) -> float:
@@ -155,6 +167,7 @@ class SimMarket:
         last = closes[-1]
         nxt = max(last * (1 + self._rng.normal(0, 0.0015)), 1e-6)
         closes.append(nxt)
+        self._volumes[symbol].append(float(self._rng.uniform(0.5, 3.0)))
         return nxt
 
     def price(self, symbol: str) -> float:
@@ -162,12 +175,14 @@ class SimMarket:
 
     def ohlcv(self, symbol: str, limit: int = 120) -> list[list[float]]:
         closes = list(self._closes[symbol])[-limit:]
+        volumes = list(self._volumes[symbol])[-limit:]
         now_ms = int(_now().timestamp() * 1000)
         rows = []
         for i, c in enumerate(closes):
             jitter = abs(c) * 0.001
             ts = now_ms - (len(closes) - i) * 60_000
-            rows.append([ts, c - jitter, c + jitter, c - jitter, c, 1.0])
+            vol = volumes[i] if i < len(volumes) else 1.0
+            rows.append([ts, c - jitter, c + jitter, c - jitter, c, vol])
         return rows
 
 
@@ -195,6 +210,7 @@ class TradingBot:
         self._running = False
         self._started_at: datetime | None = None
         self._ohlcv_cache: dict[str, list[list[float]]] = {}
+        self._bb_last_bar_ts: dict[str, int] = {}
         self._last_balance_fetch: float = 0.0
         self._balance_poll_sec = 60.0
 
@@ -258,6 +274,7 @@ class TradingBot:
             # 클린 스타트: 이전 세션의 잔여 포지션 표시를 비우고 무포지션으로 시작.
             self.positions.clear()
             self.state.clear_positions()
+            self.state.clear_closed_charts()
             self.state.set_balance(self.sim_market.balance)
             self._emit_log("INFO", "system", "SIM 모드: 합성 시장 + 페이퍼 잔고 10,000 USDT (무포지션 시작)")
             return
@@ -298,6 +315,7 @@ class TradingBot:
             self._emit_log("WARNING", "system", f"시작 정리 중 경고: {exc}")
         self.positions.clear()
         self.state.clear_positions()
+        self.state.clear_closed_charts()
 
         bal, bal_err = await self.engine.fetch_balance_usdt()
         self.state.set_balance(bal)
@@ -451,6 +469,8 @@ class TradingBot:
             "INFO", "entry",
             f"진입 평가 · [{item.label}] {self._format_bilingual(title_en, title_ko, item.score)}",
         )
+        if not settings.use_news_entry:
+            return
         if not self._news_entry_allowed():
             return
         if not self._is_fresh_entry_news(item):
@@ -525,6 +545,131 @@ class TradingBot:
             symbol, side, ind, news, score, leverage, news_triggered_at, news_ko=news_ko,
         )
 
+    @staticmethod
+    def _bb_label(side: Side) -> str:
+        return f"BB BREAKOUT {side.upper()}"
+
+    def _log_bb_entry_fail(self, symbol: str, result) -> None:
+        """BB 돌파 평가 실패 시 진입 로그에 사유를 남긴다."""
+        if result.ok:
+            return
+        if result.reason == "BB_WIDTH":
+            self._emit_log(
+                "INFO", "entry",
+                f"BB 진입 실패 {symbol}: {BB_FAIL_LABELS['BB_WIDTH']} "
+                f"(bb_min={settings.bb_min}%)",
+            )
+            return
+        if not result.side or not result.reason:
+            return
+        detail = BB_FAIL_LABELS.get(result.reason, result.reason)
+        extra = ""
+        if result.reason == "VOLUME" and result.volume_ratio is not None:
+            extra = f" · ratio {result.volume_ratio:.2f} < {settings.vol_mult}"
+        elif result.reason == "TREND":
+            extra = (
+                f" · 모드={settings.bb_trend_mode}, len={settings.f_trend_len}, "
+                f"pct={settings.f_trend_pct}"
+            )
+        elif result.reason == "RANGE":
+            extra = f" · min_range={settings.min_range_pct}%"
+        self._emit_log(
+            "INFO", "entry",
+            f"BB 진입 실패 {symbol}: {self._bb_label(result.side)} · {detail}{extra}",
+        )
+
+    def _account_balances(self) -> tuple[float, float]:
+        """(가용 잔고, 총 평가 잔고) — 오픈 포지션 증거금·미실현 포함."""
+        free = self.state.get_balance()
+        used = 0.0
+        unrealized = 0.0
+        for pv in self.state.get_positions():
+            lev = max(int(getattr(pv, "leverage", 1) or 1), 1)
+            notional = float(getattr(pv, "notional", 0) or 0)
+            if notional > 0:
+                used += notional / lev
+                unrealized += notional * float(getattr(pv, "unrealized_pct", 0) or 0) / 100
+        return free, free + used + unrealized
+
+    async def _fetch_ohlcv_1m(self, symbol: str, limit: int = BB_OHLCV_LIMIT) -> list[list[float]] | None:
+        if self.sim:
+            rows = self.sim_market.ohlcv(symbol, limit=limit)
+            return rows if len(rows) >= limit else None
+        if self.engine is None:
+            return None
+        df = await self.engine.fetch_ohlcv_df(symbol, limit=limit, timeframe="1m")
+        if df is None or len(df) < limit:
+            return None
+        return df.values.tolist()
+
+    async def _evaluate_bb_symbol(self, symbol: str, ind) -> None:
+        """1m BB 돌파 평가 — 최초 진입 또는 추가 진입."""
+        ohlcv = await self._fetch_ohlcv_1m(symbol)
+        if not ohlcv:
+            return
+        bar_ts = int(ohlcv[-1][0])
+        if self._bb_last_bar_ts.get(symbol) == bar_ts:
+            return
+        self._bb_last_bar_ts[symbol] = bar_ts
+
+        result = evaluate_bb_entry(ohlcv)
+        pos = self.positions.get(symbol)
+        if pos is None:
+            if not result.ok:
+                self._log_bb_entry_fail(symbol, result)
+                return
+            await self._maybe_enter_bb(symbol, result.side, ind)
+        elif not pos.added:
+            if not result.ok:
+                if result.side == pos.side:
+                    self._log_bb_entry_fail(symbol, result)
+                return
+            if result.side != pos.side:
+                self._emit_log(
+                    "INFO", "entry",
+                    f"BB 추가진입 실패 {symbol}: 방향 불일치 "
+                    f"(보유 {pos.side.upper()} / 신호 {result.side.upper()})",
+                )
+                return
+            await self._maybe_add_bb(symbol, pos, result.side, ind)
+
+    async def _maybe_enter_bb(self, symbol: str, side: Side, ind) -> None:
+        async with self._lock:
+            if symbol in self.positions:
+                return
+            if len(self.positions) >= settings.max_positions:
+                self._emit_log(
+                    "WARNING", "entry",
+                    f"진입 보류 {symbol}: 동시 포지션 한도({settings.max_positions}) 도달",
+                )
+                return
+
+        label = self._bb_label(side)
+        leverage = max(1, int(settings.bb_leverage))
+        await self._open(
+            symbol, side, ind, label, 0.0, leverage, _now(), news_ko="",
+        )
+
+    async def _maybe_add_bb(
+        self, symbol: str, pos: Position, side: Side, ind,
+    ) -> None:
+        if pos.added or side != pos.side:
+            return
+        favorable = (
+            (pos.side == "long" and ind.last_price > pos.entry_price)
+            or (pos.side == "short" and ind.last_price < pos.entry_price)
+        )
+        label = self._bb_label(side)
+        if not favorable:
+            self._emit_log(
+                "INFO", "entry",
+                f"추가진입 보류 {symbol}: 가격 미유리(현재 {ind.last_price:.4f} / "
+                f"평균 {pos.entry_price:.4f}) | {label}",
+            )
+            return
+        add_lev = min(pos.leverage + 1, settings.bb_max_add_leverage)
+        await self._add(pos, ind, label, 0.0, max(1, int(add_lev)))
+
     # ---- 진입 ----
     async def _open(
         self,
@@ -575,8 +720,9 @@ class TradingBot:
             )
             pos.prev_rsi = ind.rsi
             self.positions[symbol] = pos
+        self.state.clear_closed_chart(symbol)
 
-        ctx = self._news_context(news, score, news_ko)
+        ctx = self._news_context(news, score, news_ko) if score or news_ko else news
         self._emit_log(
             "INFO", "entry",
             f"진입 {side.upper()} {symbol} | 진입가={order_price:.4f} 수량={filled:.6f} "
@@ -684,7 +830,7 @@ class TradingBot:
             if news_ko:
                 pos.entry_news_ko = news_ko
 
-        ctx = self._news_context(news, score, news_ko)
+        ctx = self._news_context(news, score, news_ko) if score or news_ko else news
         self._emit_log(
             "INFO", "entry",
             f"➕ 추가진입 {pos.side.upper()} {pos.symbol} | 추가가={add_price:.4f} "
@@ -734,6 +880,9 @@ class TradingBot:
             if ohlcv:
                 self.state.set_ohlcv(symbol, ohlcv)
 
+            if settings.use_bb_entry:
+                await self._evaluate_bb_symbol(symbol, ind)
+
             pos = self.positions.get(symbol)
             if pos is None:
                 continue
@@ -780,6 +929,26 @@ class TradingBot:
 
         async with self._lock:
             self.positions.pop(pos.symbol, None)
+        self.state.set_closed_chart(
+            ClosedChartView(
+                symbol=pos.symbol,
+                side=pos.side,
+                entry_price=pos.entry_price,
+                exit_price=exit_price,
+                stop_loss=pos.stop_loss_price,
+                trailing_stop=pos.trailing_stop,
+                trailing_active=pos.trailing_active,
+                entry_news=pos.entry_news,
+                entry_news_ko=pos.entry_news_ko,
+                entry_score=pos.entry_score,
+                opened_at=format_kst(pos.opened_at),
+                opened_at_ms=int(pos.opened_at.timestamp() * 1000),
+                closed_at_ms=int(_now().timestamp() * 1000),
+                news_triggered_at_ms=int(pos.news_triggered_at.timestamp() * 1000),
+                exit_type=signal.exit_type,
+                pnl_pct=pnl_pct,
+            )
+        )
         self.state.remove_position(pos.symbol)
 
         if not self.sim and self.engine is not None:
@@ -813,12 +982,14 @@ class TradingBot:
         )
 
         if self.notifier is not None:
+            bal_free, bal_equity = self._account_balances()
             await self.notifier.send_position_close(
                 symbol=pos.symbol, side=pos.side, amount_usdt=pos.notional,
                 entry_price=pos.entry_price, exit_price=exit_price, pnl_pct=pnl_pct,
                 reason=f"{signal.exit_type}: {signal.reason}",
                 news=pos.entry_news, score=pos.entry_score,
                 pnl_usdt=pnl_usdt, news_ko=pos.entry_news_ko,
+                balance_free=bal_free, balance_equity=bal_equity,
             )
 
     # ---- 헬퍼 ----

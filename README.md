@@ -90,15 +90,22 @@ Either way the same FinBERT pipeline and entry logic are reused unchanged.
 
 ### News source modes (`NEWS_SOURCE_MODE`)
 
-| Mode             | RSS | coinnesskr | CryptoPanic |
-| ---------------- | :-: | :--------: | :---------: |
-| `rss`            |  O  |            |             |
-| `coinnesskr`     |     |     O      |             |
-| `rss_coinnesskr` |  O  |     O      |             |
-| `cryptopanic`    |     |            | O (token)   |
+| Mode                 | RSS | coinnesskr | CryptoPanic | BB entry | News entry |
+| -------------------- | :-: | :--------: | :---------: | :------: | :--------: |
+| `rss`                |  O  |            |             |          | O          |
+| `coinnesskr`         |     |     O      |             |          | O          |
+| `rss_coinnesskr`     |  O  |     O      |             |          | O          |
+| `cryptopanic`        |     |            | O (token)   |          | O          |
+| `rss_coinnesskr_bb`  |  O  |     O      |             | O        | O (OR)     |
+| `bb_only`            |  O  |     O      |             | O        |            |
+
+`rss_coinnesskr_bb`: enter on **strong news OR** 1m Bollinger breakout (see
+`BBBQ_요구사항.md`). Cross-signal pyramiding: one add-on per position (+1
+leverage) when the other path confirms the same direction.
 
 Default is `rss_coinnesskr`. You can also switch modes at runtime from the
 Streamlit sidebar **뉴스 소스** selector (stop the bot, change, then restart).
+BB parameters are in the sidebar **BB 진입 파라미터** expander.
 
 ### Telegram credentials: two separate things
 
@@ -168,7 +175,18 @@ asyncio.run(main())
 | `MAX_POSITIONS`       | Max simultaneous positions (default `2`).      |
 | `ORDER_TIME_IN_FORCE` | `IOC` or `FOK` for marketable-limit orders.    |
 | `POSITION_SIZE_USDT`  | Notional size per entry in USDT.               |
-| `LEVERAGE`            | Leverage multiplier applied per symbol.        |
+| `LEVERAGE`            | News entry leverage (manual mode) or fallback. |
+| `BB_LEVERAGE`         | Bollinger breakout **initial** entry leverage.   |
+| `BB_MAX_ADD_LEVERAGE` | Cap for BB pyramiding (+1 per add).              |
+
+### Bollinger breakout entry (`bb_breakout.py`)
+
+When `NEWS_SOURCE_MODE` includes BB (`rss_coinnesskr_bb` or `bb_only`), the
+monitor loop evaluates **1m × 100 candles** for band breakout + volume/trend
+filters. Configure via `BB_LEN`, `BB_MULT`, `BB_MIN`, `VOL_MULT`, `VOL_LEN`,
+`F_TREND_LEN`, `F_TREND_PCT`, `MIN_RANGE_PCT`, `BB_TREND_MODE` (`off` /
+`relaxed` / `strict`) or the Streamlit sidebar.
+Popup charts support **Bollinger bands + volume** on the 1m timeframe.
 
 ## Stage 4: dynamic exits + Streamlit dashboard
 
@@ -264,7 +282,7 @@ Optional (coinnesskr news source — required only for `coinnesskr` /
 
 | Variable                | Description                                            |
 | ----------------------- | ------------------------------------------------------ |
-| `NEWS_SOURCE_MODE`      | `rss` / `coinnesskr` / `rss_coinnesskr` / `cryptopanic`. |
+| `NEWS_SOURCE_MODE`      | `rss` / `coinnesskr` / `rss_coinnesskr` / `cryptopanic` / `rss_coinnesskr_bb` / `bb_only`. |
 | `TELEGRAM_API_ID`       | Telethon API id from my.telegram.org (receiving).      |
 | `TELEGRAM_API_HASH`     | Telethon API hash from my.telegram.org (receiving).    |
 | `TELEGRAM_SESSION_NAME` | Session file name (default `tradingbot_plus`).         |
