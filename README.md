@@ -103,7 +103,7 @@ Either way the same FinBERT pipeline and entry logic are reused unchanged.
 `BBBQ_요구사항.md`). Cross-signal pyramiding: one add-on per position (+1
 leverage) when the other path confirms the same direction.
 
-Default is `rss_coinnesskr`. You can also switch modes at runtime from the
+Default is `rss_coinnesskr_bb`. You can also switch modes at runtime from the
 Streamlit sidebar **뉴스 소스** selector (stop the bot, change, then restart).
 BB parameters are in the sidebar **BB 진입 파라미터** expander.
 

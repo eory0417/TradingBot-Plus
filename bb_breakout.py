@@ -58,9 +58,8 @@ def _bb_width_ok(bb: BollingerBands, bb_min: float) -> bool:
     return bb_min == 0 or bb.bb_width_pct >= bb_min
 
 
-def _detect_breakout(price: float, bb: BollingerBands, bb_min: float) -> Side | None:
-    if not _bb_width_ok(bb, bb_min):
-        return None
+def _raw_breakout_side(price: float, bb: BollingerBands) -> Side | None:
+    """종가가 upper/lower를 넘었는지만 판정 (밴드 폭·필터 무관)."""
     long_ok = price > bb.upper
     short_ok = price < bb.lower
     if long_ok and short_ok:
@@ -137,18 +136,18 @@ def _check_range(high: float, low: float, price: float, min_range_pct: float) ->
 
 
 def evaluate_bb_entry(
-    ohlcv_rows: list[list[float]],
+    ohlcv_rows: list[list[float]] | np.ndarray,
     cfg: Settings | None = None,
 ) -> BbEntryResult:
     """1분봉 OHLCV로 BB 돌파 진입 가능 여부를 판정한다.
 
-    ``ohlcv_rows``: ``[[ts, open, high, low, close, volume], ...]``
+    ``ohlcv_rows``: ``(n, 6)`` ndarray 또는 ``[[ts, o, h, l, c, v], ...]``
     """
     cfg = cfg or settings
-    if len(ohlcv_rows) < BB_OHLCV_LIMIT:
+    arr = np.asarray(ohlcv_rows, dtype=float)
+    if arr.shape[0] < BB_OHLCV_LIMIT:
         return BbEntryResult(ok=False, reason=None)
 
-    arr = np.asarray(ohlcv_rows, dtype=float)
     closes = arr[:, 4]
     volumes = arr[:, 5]
     last = arr[-1]
@@ -161,12 +160,12 @@ def evaluate_bb_entry(
     if bb is None:
         return BbEntryResult(ok=False, reason=None)
 
-    if not _bb_width_ok(bb, cfg.bb_min):
-        return BbEntryResult(ok=False, reason="BB_WIDTH")
-
-    side = _detect_breakout(price, bb, cfg.bb_min)
+    side = _raw_breakout_side(price, bb)
     if side is None:
         return BbEntryResult(ok=False, reason=None)
+
+    if not _bb_width_ok(bb, cfg.bb_min):
+        return BbEntryResult(ok=False, side=side, reason="BB_WIDTH")
 
     vol_ok, vol_ratio = _check_volume(volumes, cfg.vol_len, cfg.vol_mult)
     if not vol_ok:

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import html
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -18,6 +19,7 @@ import streamlit as st
 import bot as botmod
 import chart_data
 import finetune
+from backtest.ui import render_backtest_tab
 from bb_breakout import bb_series_for_chart
 from kst_util import KST, TZ_LABEL, format_gui_hms, format_kst, ms_to_kst_pandas, now_kst, series_ms_to_kst_pandas, to_kst
 from config import settings
@@ -85,7 +87,21 @@ st.markdown(
     .badge-exit { background: #58a6ff; }
     .badge-fail { background: #f85149; color: #fff; }
     .badge-news { background: #a371f7; }
-    .pos-row { font-size: 0.82rem; }
+    .pos-row { font-size: 0.72rem; line-height: 1.25; }
+    .pos-head { font-size: 0.68rem; color: #8b949e; }
+    .account-bar {
+        display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 1rem;
+        font-size: 0.74rem; color: #8b949e;
+        padding: 0.28rem 0.55rem; margin-bottom: 0.2rem;
+        background: rgba(38, 43, 56, 0.55);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 6px;
+    }
+    .account-bar b { color: #e6edf3; font-weight: 600; }
+    .account-bar .sep { color: rgba(255,255,255,0.15); user-select: none; }
+    .chart-grid-title {
+        font-size: 0.78rem; color: #8b949e; margin: 0.15rem 0 0.25rem 0;
+    }
     .bot-status-hint {
         font-size: 0.68rem; color: #8b949e; margin-top: -0.35rem;
         line-height: 1.2; white-space: nowrap; overflow: hidden;
@@ -93,13 +109,110 @@ st.markdown(
     }
     div[data-testid="column"] { padding: 0 0.25rem !important; }
     hr { margin: 0.35rem 0 !important; border-color: rgba(255,255,255,0.08) !important; }
+    /* ---- 사이드바 컴팩트 ---- */
+    section[data-testid="stSidebar"] {
+        font-size: 0.76rem;
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+        max-height: 100vh;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding-top: 0.35rem;
+        padding-bottom: 0.75rem;
+    }
+    section[data-testid="stSidebar"] [data-testid="stHeader"] {
+        font-size: 0.82rem !important;
+        margin: 0 0 0.2rem 0 !important;
+        padding: 0 !important;
+    }
+    section[data-testid="stSidebar"] label[data-testid="stWidgetLabel"] p,
+    section[data-testid="stSidebar"] label p {
+        font-size: 0.68rem !important;
+        line-height: 1.15 !important;
+        margin-bottom: 0.1rem !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+        font-size: 0.65rem !important;
+        line-height: 1.25 !important;
+        margin-bottom: 0.08rem !important;
+    }
+    section[data-testid="stSidebar"] .stNumberInput input,
+    section[data-testid="stSidebar"] input[type="number"] {
+        font-size: 0.72rem !important;
+        padding: 0.2rem 0.35rem !important;
+        min-height: 1.55rem !important;
+    }
+    section[data-testid="stSidebar"] div[data-baseweb="select"] > div {
+        font-size: 0.72rem !important;
+        min-height: 1.55rem !important;
+    }
+    section[data-testid="stSidebar"] .stSlider {
+        padding: 0.1rem 0 0.35rem 0 !important;
+    }
+    section[data-testid="stSidebar"] .stSlider [data-testid="stThumbValue"] {
+        font-size: 0.68rem !important;
+    }
+    section[data-testid="stSidebar"] .stCheckbox label p {
+        font-size: 0.7rem !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stExpander"] summary {
+        font-size: 0.72rem !important;
+        padding: 0.25rem 0 !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stExpander"] summary p {
+        font-size: 0.72rem !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="column"] {
+        padding: 0 0.12rem !important;
+    }
+    section[data-testid="stSidebar"] hr {
+        margin: 0.2rem 0 !important;
+    }
+    section[data-testid="stSidebar"] .stButton button {
+        font-size: 0.72rem !important;
+        padding: 0.25rem 0.4rem !important;
+        min-height: 1.7rem !important;
+    }
+    /* 백테스트 진행률 — progress text 파라미터 대신 별도 라벨 */
+    .bt-progress-box {
+        margin: 0.35rem 0 0.55rem 0;
+        padding: 0.5rem 0.7rem 0.55rem 0.7rem;
+        background: rgba(56, 139, 253, 0.1);
+        border: 1px solid rgba(56, 139, 253, 0.28);
+        border-radius: 8px;
+        overflow: visible;
+    }
+    .bt-progress-title {
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: #58a6ff;
+        margin-bottom: 0.2rem;
+    }
+    .bt-progress-msg {
+        font-size: 0.78rem;
+        line-height: 1.45;
+        color: #e6edf3;
+        margin-bottom: 0.35rem;
+        word-break: break-word;
+    }
+    .bt-progress-pct {
+        font-size: 0.72rem;
+        color: #8b949e;
+        margin-top: 0.2rem;
+    }
+    div[data-testid="stProgress"] {
+        margin: 0 !important;
+    }
+    div[data-testid="stProgress"] label {
+        display: none !important;
+    }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-_NEWS_LOG_HEIGHT = 230
-_CHART_HEIGHT = 280
+_NEWS_LOG_HEIGHT = 210
+_CHART_HEIGHT = 235
 _CHART_POPUP_HEIGHT = 640
 
 # 뉴스 소스 모드 라벨(사이드바 selectbox 표시용).
@@ -262,56 +375,98 @@ def _news_time_meta(nw) -> str:
 def render_sidebar() -> None:
     st.sidebar.header("⚙️ 설정")
 
-    # 증거금 모드는 항상 isolated 로 고정(선택 UI 제거).
     margin_mode = "isolated"
-    manual_leverage = st.sidebar.checkbox(
-        "뉴스 수동 레버리지", value=not settings.auto_leverage,
-        help="체크: 뉴스 진입 레버리지 직접 설정 · 해제: 뉴스 점수로 자동 설정",
-    )
+    lev_c1, lev_c2 = st.sidebar.columns(2)
+    with lev_c1:
+        manual_leverage = st.checkbox(
+            "뉴스 수동 레버",
+            value=not settings.auto_leverage,
+            help="체크: 뉴스 레버 직접 · 해제: 점수 자동",
+        )
     auto_leverage = not manual_leverage
     if manual_leverage:
-        leverage = st.sidebar.slider(
-            "뉴스 레버리지", 1, 25, settings.leverage,
-            help="뉴스 기반 진입·뉴스 피라미딩에만 적용",
-        )
+        with lev_c2:
+            leverage = st.slider(
+                "뉴스 레버", 1, 25, settings.leverage,
+                help="뉴스 진입·피라미딩",
+            )
     else:
-        leverage = settings.leverage  # 자동 모드: 진입 시 점수로 결정
+        leverage = settings.leverage
         st.sidebar.caption(
-            "뉴스 자동 레버리지: |점수| 0.7→1x · 0.8→2x · 0.9→3x · 1.0→4x "
-            "(점수 1.0·역방향이면 2x 진입)"
+            "자동: |점수| 0.7→1x · 0.8→2x · 0.9→3x · 1.0→4x (역방향 2x)"
         )
-    notional = st.sidebar.number_input(
-        "진입금 (USDT)", min_value=5.0, value=float(settings.position_size_usdt), step=5.0
+
+    _sl_modes = ("fixed", "atr")
+    _sl_labels = {"fixed": "고정 %", "atr": "ATR 배수"}
+    cur_sl_mode = settings.stop_loss_mode if settings.stop_loss_mode in _sl_modes else "fixed"
+    sl_mode = st.sidebar.selectbox(
+        "손절 방식",
+        _sl_modes,
+        index=_sl_modes.index(cur_sl_mode),
+        format_func=lambda k: _sl_labels[k],
+        help="고정 %: 진입가 대비 · ATR: 진입 시점 ATR×배수",
     )
-    stop_loss = st.sidebar.number_input(
-        "손절 (%)", min_value=0.1, value=float(settings.stop_loss_pct), step=0.1
-    )
-    trailing_profit = st.sidebar.number_input(
-        "Trailing 이익구간 (%)",
-        min_value=0.0,
-        value=float(settings.trailing_profit_pct),
-        step=0.1,
-        help="미실현 이익이 이 값 이상일 때만 Trailing 익절이 활성화됩니다.",
-    )
-    atr_mult = st.sidebar.number_input(
-        "Trailing ATR", min_value=0.5, value=float(settings.trailing_atr_mult), step=0.5
-    )
-    time_exit = st.sidebar.number_input(
-        "시간청산 (h)", min_value=0.5, value=float(settings.time_exit_hours), step=0.5
-    )
+    settings.stop_loss_mode = sl_mode
+
+    r1c1, r1c2 = st.sidebar.columns(2)
+    with r1c1:
+        notional = st.number_input(
+            "진입금", min_value=5.0, value=float(settings.position_size_usdt), step=5.0,
+        )
+    with r1c2:
+        if sl_mode == "fixed":
+            stop_loss = st.number_input(
+                "손절 %", min_value=0.1, value=float(settings.stop_loss_pct), step=0.1,
+            )
+            settings.stop_loss_pct = float(stop_loss)
+        else:
+            sl_atr = st.number_input(
+                "손절 ATR",
+                min_value=0.5,
+                value=float(settings.stop_loss_atr_mult),
+                step=0.5,
+                help="진입 ATR × 배수 거리에 손절",
+            )
+            settings.stop_loss_atr_mult = float(sl_atr)
+
+    r2c1, r2c2 = st.sidebar.columns(2)
+    with r2c1:
+        trailing_profit = st.number_input(
+            "Trail 이익 %",
+            min_value=0.0,
+            value=float(settings.trailing_profit_pct),
+            step=0.1,
+            help="미실현 이익이 이 값 이상일 때 Trailing 활성",
+        )
+    with r2c2:
+        atr_mult = st.number_input(
+            "Trail ATR", min_value=0.5, value=float(settings.trailing_atr_mult), step=0.5,
+        )
+
+    r3c1, _r3c2 = st.sidebar.columns(2)
+    with r3c1:
+        time_exit = st.number_input(
+            "시간청산 h", min_value=0.5, value=float(settings.time_exit_hours), step=0.5,
+        )
 
     settings.margin_mode = margin_mode
     settings.auto_leverage = bool(auto_leverage)
     settings.leverage = int(leverage)
     settings.position_size_usdt = float(notional)
-    settings.stop_loss_pct = float(stop_loss)
+    if sl_mode == "fixed":
+        settings.stop_loss_pct = float(stop_loss)
+    else:
+        settings.stop_loss_atr_mult = float(sl_atr)
     settings.trailing_profit_pct = float(trailing_profit)
     settings.trailing_atr_mult = float(atr_mult)
     settings.time_exit_hours = float(time_exit)
     STATE.update_settings(
         margin_mode=margin_mode, auto_leverage=bool(auto_leverage),
         leverage=int(leverage), notional=float(notional),
-        stop_loss_pct=float(stop_loss), trailing_profit_pct=float(trailing_profit),
+        stop_loss_mode=sl_mode,
+        stop_loss_pct=float(settings.stop_loss_pct),
+        stop_loss_atr_mult=float(settings.stop_loss_atr_mult),
+        trailing_profit_pct=float(trailing_profit),
         trailing_atr_mult=float(atr_mult),
         time_exit_hours=float(time_exit),
     )
@@ -319,7 +474,6 @@ def render_sidebar() -> None:
     st.sidebar.divider()
     running = runner.is_alive() or STATE.running
 
-    # ---- 뉴스 소스 선택(봇 정지 상태에서만 변경 가능, 변경 후 재시작 필요) ----
     mode_keys = list(NEWS_MODE_LABELS.keys())
     cur_mode = settings.news_source_mode
     cur_idx = mode_keys.index(cur_mode) if cur_mode in mode_keys else 0
@@ -329,48 +483,58 @@ def render_sidebar() -> None:
         index=cur_idx,
         format_func=lambda k: NEWS_MODE_LABELS[k],
         disabled=running,
-        help="변경하려면 봇을 정지한 뒤 선택하고 다시 시작하세요.",
+        help="변경: 봇 정지 후 선택·재시작",
     )
     if not running and chosen != cur_mode:
         settings.news_source_mode = chosen
     if running:
-        st.sidebar.caption("뉴스 소스는 실행 중 변경할 수 없습니다 — 정지 후 변경하세요.")
+        st.sidebar.caption("뉴스 소스는 실행 중 변경 불가")
 
-    with st.sidebar.expander("BB 진입 파라미터", expanded=settings.use_bb_entry):
+    with st.sidebar.expander("BB 진입", expanded=settings.use_bb_entry):
         bb_disabled = running
-        settings.bb_leverage = int(st.slider(
-            "BB 레버리지",
-            min_value=1,
-            max_value=int(settings.bb_max_add_leverage),
-            value=int(settings.bb_leverage),
-            disabled=bb_disabled,
-            help="볼린저 돌파 최초 진입 전용 (뉴스 레버리지와 별도)",
-        ))
-        settings.bb_len = int(st.number_input(
-            "BB Length", min_value=5, max_value=100, value=int(settings.bb_len),
-            step=1, disabled=bb_disabled,
-        ))
-        settings.bb_mult = float(st.number_input(
-            "BB Mult (Std)", min_value=0.5, max_value=5.0, value=float(settings.bb_mult),
-            step=0.1, disabled=bb_disabled,
-        ))
-        settings.bb_min = float(st.number_input(
-            "BB Min Width %", min_value=0.0, max_value=10.0, value=float(settings.bb_min),
-            step=0.05, disabled=bb_disabled,
-        ))
-        settings.vol_mult = float(st.number_input(
-            "Vol Mult", min_value=0.0, max_value=10.0, value=float(settings.vol_mult),
-            step=0.1, disabled=bb_disabled,
-        ))
-        settings.vol_len = int(st.number_input(
-            "Vol Lookback", min_value=1, max_value=100, value=int(settings.vol_len),
-            step=1, disabled=bb_disabled,
-        ))
+        bb1, bb2 = st.columns(2)
+        with bb1:
+            settings.bb_leverage = int(st.slider(
+                "BB 레버",
+                min_value=1,
+                max_value=4,
+                value=max(1, min(4, int(settings.bb_leverage))),
+                step=1,
+                disabled=bb_disabled,
+                help="BB 최초 진입 레버리지 (뉴스 LEVERAGE와 별도)",
+            ))
+        with bb2:
+            settings.bb_len = int(st.number_input(
+                "BB Len", min_value=5, max_value=100, value=int(settings.bb_len),
+                step=1, disabled=bb_disabled,
+            ))
+        bb3, bb4 = st.columns(2)
+        with bb3:
+            settings.bb_mult = float(st.number_input(
+                "BB Mult", min_value=0.5, max_value=5.0, value=float(settings.bb_mult),
+                step=0.1, disabled=bb_disabled,
+            ))
+        with bb4:
+            settings.bb_min = float(st.number_input(
+                "BB Min %", min_value=0.0, max_value=10.0, value=float(settings.bb_min),
+                step=0.05, disabled=bb_disabled,
+            ))
+        bb5, bb6 = st.columns(2)
+        with bb5:
+            settings.vol_mult = float(st.number_input(
+                "Vol Mult", min_value=0.0, max_value=10.0, value=float(settings.vol_mult),
+                step=0.1, disabled=bb_disabled,
+            ))
+        with bb6:
+            settings.vol_len = int(st.number_input(
+                "Vol Len", min_value=1, max_value=100, value=int(settings.vol_len),
+                step=1, disabled=bb_disabled,
+            ))
         _trend_modes = ("relaxed", "strict", "off")
         _trend_labels = {
-            "relaxed": "완화 (50% 동조)",
-            "strict": "엄격 (60% 동조, 명세)",
-            "off": "끔 (순수 돌파)",
+            "relaxed": "완화 (50%)",
+            "strict": "엄격 (60%)",
+            "off": "끔",
         }
         cur_trend = settings.bb_trend_mode
         if cur_trend not in _trend_modes:
@@ -381,22 +545,25 @@ def render_sidebar() -> None:
             index=_trend_modes.index(cur_trend),
             format_func=lambda k: _trend_labels[k],
             disabled=bb_disabled,
-            help="relaxed: 급격한 돌파 포착 · strict: BBBQ 명세 · off: BB+거래량만",
+            help="relaxed·strict·off",
         )
         settings.bb_trend_mode = trend_pick
-        settings.f_trend_len = int(st.number_input(
-            "Trend Len", min_value=0, max_value=50, value=int(settings.f_trend_len),
-            step=1, disabled=bb_disabled,
-            help="추세 필터 끔(off) 또는 0이면 기울기 검사 생략",
-        ))
-        settings.f_trend_pct = float(st.number_input(
-            "Trend Min %", min_value=0.0, max_value=5.0, value=float(settings.f_trend_pct),
-            step=0.05, disabled=bb_disabled,
-        ))
-        settings.min_range_pct = float(st.number_input(
-            "Min Range %", min_value=0.0, max_value=5.0, value=float(settings.min_range_pct),
-            step=0.05, disabled=bb_disabled, help="0이면 비활성",
-        ))
+        bb7, bb8 = st.columns(2)
+        with bb7:
+            settings.f_trend_len = int(st.number_input(
+                "Trend Len", min_value=0, max_value=50, value=int(settings.f_trend_len),
+                step=1, disabled=bb_disabled,
+                help="off 또는 0이면 생략",
+            ))
+            settings.min_range_pct = float(st.number_input(
+                "Min Range %", min_value=0.0, max_value=5.0, value=float(settings.min_range_pct),
+                step=0.05, disabled=bb_disabled, help="0=비활성",
+            ))
+        with bb8:
+            settings.f_trend_pct = float(st.number_input(
+                "Trend %", min_value=0.0, max_value=5.0, value=float(settings.f_trend_pct),
+                step=0.05, disabled=bb_disabled,
+            ))
 
     st.sidebar.divider()
     col1, col2 = st.sidebar.columns(2)
@@ -415,22 +582,22 @@ def render_sidebar() -> None:
 
     mode = botmod.exchange_mode_label()
     if runner.is_alive():
-        thread_label = "🟢 스레드 실행 중"
+        thread_label = "🟢 실행 중"
     elif STATE.running:
-        thread_label = "🟡 시작 처리 중"
+        thread_label = "🟡 시작 중"
     else:
         thread_label = "⚪ 대기"
-    st.sidebar.caption(f"{thread_label} · 모드: **{mode}** · **{STATE.status}**")
+    st.sidebar.caption(f"{thread_label} · {mode} · {STATE.status}")
     if botmod.has_real_credentials() and settings.binance_testnet:
-        st.sidebar.caption("Demo: demo.binance.com 키 필요. 실거래는 BINANCE_TESTNET=false")
-    st.sidebar.caption("ℹ️ 설정 변경은 즉시 반영되며, 진행 중 포지션이 아닌 '앞으로의 진입'에만 적용됩니다.")
+        st.sidebar.caption("Demo 키: demo.binance.com")
+    st.sidebar.caption("ℹ️ 설정은 다음 진입부터 적용")
 
     st.sidebar.divider()
-    st.sidebar.caption(f"🧠 FinBERT 재학습 · 누적 샘플 {finetune.sample_count()}건")
+    st.sidebar.caption(f"🧠 FinBERT · 샘플 {finetune.sample_count()}건")
     bot = getattr(runner, "bot", None)
     if st.sidebar.button(
-        "🔄 모델 재학습(수동)", width="stretch",
-        disabled=bot is None, help="월 1회 자동 재학습. 지금 즉시 실행하려면 클릭.",
+        "🔄 재학습", width="stretch",
+        disabled=bot is None, help="월 1회 자동 · 즉시 실행",
     ):
         if bot is not None:
             bot.trigger_finetune()
@@ -580,6 +747,7 @@ def build_candlestick_figure(
     news_markers: list[dict] | None = None,
     timeframe: str = "15m",
     show_legend: bool = False,
+    enable_click_select: bool = False,
 ) -> go.Figure | None:
     """OHLCV + 설정값 BB + 하단 거래량 차트."""
     if not ohlcv:
@@ -792,15 +960,41 @@ def build_candlestick_figure(
         ann.font = dict(color="#8b949e", size=10)
     fig.update_xaxes(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.06)")
     fig.update_yaxes(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.06)")
+    if enable_click_select:
+        # Candlestick alone rarely emits Streamlit selection — invisible markers capture clicks.
+        fig.add_trace(
+            go.Scatter(
+                x=df["time"],
+                y=df["close"],
+                mode="markers",
+                marker=dict(size=14, opacity=0.01, color="rgba(255,255,255,0.01)"),
+                showlegend=False,
+                hoverinfo="skip",
+                name="_click",
+            ),
+            row=1,
+            col=1,
+        )
+        fig.update_layout(clickmode="event+select", dragmode=False)
     return fig
 
 
-def candlestick(symbol: str, height: int = _CHART_HEIGHT) -> go.Figure | None:
+def candlestick(
+    symbol: str,
+    height: int = _CHART_HEIGHT,
+    *,
+    enable_click_select: bool = False,
+) -> go.Figure | None:
     ohlcv = STATE.get_ohlcv(symbol)
     pos = _chart_overlay(symbol)
     news_markers = _collect_news_markers(symbol, pos)
     return build_candlestick_figure(
-        symbol, ohlcv, height=height, pos=pos, news_markers=news_markers,
+        symbol,
+        ohlcv,
+        height=height,
+        pos=pos,
+        news_markers=news_markers,
+        enable_click_select=enable_click_select,
     )
 
 
@@ -900,6 +1094,76 @@ def _account_summary(free_usdt: float, positions: list) -> dict[str, float]:
         "unrealized": unrealized,
         "equity": equity,
     }
+
+
+def _request_chart_zoom(symbol: str) -> None:
+    """차트 클릭(선택) → 확대 다이얼로그 (연속 트리거 방지)."""
+    debounce = st.session_state.setdefault("_chart_zoom_debounce", {})
+    now = time.time()
+    if debounce.get(symbol, 0) + 0.8 > now:
+        return
+    debounce[symbol] = now
+    st.session_state["zoom_symbol"] = symbol
+    st.session_state["pending_dialog"] = ("chart", symbol)
+    st.rerun(scope="app")
+
+
+def _chart_zoom_handler(symbol: str):
+    """Plotly on_select 콜백 — fragment가 아닌 전체 앱 rerun으로 다이얼로그 오픈."""
+    def _on_select() -> None:
+        _request_chart_zoom(symbol)
+
+    return _on_select
+
+
+def _account_bar_html(acct: dict, positions: list, status: str, bot_label: str, bot_hint: str) -> str:
+    """상단 계좌·상태 한 줄 요약."""
+    pos_n = len(positions)
+    parts = [
+        f'가용 <b>{acct["free"]:,.2f}</b> USDT',
+        f'평가 <b>{acct["equity"]:,.2f}</b> USDT',
+        f'포지션 <b>{pos_n}/{settings.max_positions}</b>',
+        f'상태 <b>{html.escape(str(status))}</b>',
+        f'봇 <b>{html.escape(bot_label)}</b>',
+    ]
+    if positions:
+        parts.insert(2, f'미실현 <b>{acct["unrealized"]:+,.2f}</b> USDT')
+    hint = html.escape(bot_hint)
+    inner = ' <span class="sep">|</span> '.join(parts)
+    return f'<div class="account-bar">{inner} · <span title="{hint}">{hint}</span></div>'
+
+
+def _dashboard_chart_symbols() -> list[str]:
+    """대시보드 2×2 그리드 — 거래 대상 전 종목."""
+    return list(settings.symbols)
+
+
+def _render_mini_chart(col, symbol: str) -> None:
+    """대시보드 미니 차트 — 캔들/심볼 클릭 시 확대."""
+    fig = candlestick(symbol, enable_click_select=True)
+    if fig is None:
+        col.caption(f"{symbol} · 데이터 수집 중…")
+        return
+    head_l, head_r = col.columns([5, 1])
+    with head_l:
+        if head_l.button(
+            symbol,
+            key=f"zoom_hdr_{_sym_key(symbol)}",
+            type="tertiary",
+            help="클릭하여 확대",
+        ):
+            _request_chart_zoom(symbol)
+    with head_r:
+        head_r.caption("🔍")
+    col.plotly_chart(
+        fig,
+        width="stretch",
+        key=f"chart_{_sym_key(symbol)}",
+        on_select=_chart_zoom_handler(symbol),
+        selection_mode=("points", "box"),
+        config={"displayModeBar": False, "scrollZoom": False},
+    )
+
 
 
 @st.dialog("📊 수익률 통계", width="large")
@@ -1054,25 +1318,24 @@ def render_dashboard() -> None:
     bot_label, bot_hint = _bot_status_compact()
     acct = _account_summary(STATE.get_balance(), positions)
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("가용 잔고", f"{acct['free']:,.2f}", help="새 진입에 사용 가능한 USDT")
-    c2.metric(
-        "총 평가 잔고", f"{acct['equity']:,.2f}",
-        help=f"가용 + 투입 증거금 {acct['used_margin']:,.2f} + 미실현 {acct['unrealized']:+,.2f}",
-    )
-    c3.metric("포지션", f"{len(positions)} / {settings.max_positions}")
-    c4.metric("상태", STATE.status)
-    with c5:
-        st.metric("봇", bot_label)
-        st.markdown(f'<p class="bot-status-hint">{bot_hint}</p>', unsafe_allow_html=True)
+    bar_col, stats_col = st.columns([6, 1])
+    with bar_col:
+        st.markdown(
+            _account_bar_html(acct, positions, STATE.status, bot_label, bot_hint),
+            unsafe_allow_html=True,
+        )
+    with stats_col:
+        if st.button("📊 통계", width="stretch", key="stats_btn"):
+            st.session_state["pending_dialog"] = ("stats", None)
+            st.rerun(scope="app")
 
-    st.markdown("##### 📌 오픈 포지션")
+    st.caption("📌 오픈 포지션")
     if positions:
-        _col_w = [1.4, 0.9, 0.7, 1.2, 1.3, 1.3, 1.3, 1.3, 1.0, 1.0]
+        _col_w = [1.3, 0.8, 0.6, 1.1, 1.2, 1.2, 1.1, 1.1, 0.9, 0.9]
         _heads = ["코인", "방향", "배율", "수량", "진입", "현재", "손절", "익절", "PnL%", "청산"]
         hcols = st.columns(_col_w)
         for hc, ht in zip(hcols, _heads):
-            hc.markdown(f'<div class="pos-row"><b>{ht}</b></div>', unsafe_allow_html=True)
+            hc.markdown(f'<div class="pos-head"><b>{ht}</b></div>', unsafe_allow_html=True)
         for p in positions:
             lev = getattr(p, "leverage", 1)
             added_mark = " ➕" if getattr(p, "added", False) else ""
@@ -1103,34 +1366,21 @@ def render_dashboard() -> None:
             if rc[9].button("청산", key=f"close_{_sym_key(p.symbol)}", width="stretch"):
                 _handle_manual_close(p.symbol)
     else:
-        st.caption("오픈 포지션 없음")
+        st.caption("없음")
 
-    ch_head, ch_btn = st.columns([4, 1])
-    ch_head.markdown("##### 📈 차트 (15m)")
-    if ch_btn.button("📊 수익률 통계", width="stretch", key="stats_btn"):
-        st.session_state["pending_dialog"] = ("stats", None)
-        st.rerun()
-    open_syms = [p.symbol for p in positions]
-    closed_syms = STATE.symbols_with_closed_chart()
-    data_syms = STATE.symbols_with_data()
-    seen: set[str] = set()
-    chart_syms: list[str] = []
-    for s in open_syms + closed_syms + data_syms:
-        if s in seen:
-            continue
-        seen.add(s)
-        chart_syms.append(s)
-        if len(chart_syms) >= 2:
-            break
+    chart_syms = _dashboard_chart_symbols()
+    st.markdown(
+        '<p class="chart-grid-title">📈 차트 (15m) · 심볼·캔들 클릭 → 확대</p>',
+        unsafe_allow_html=True,
+    )
     if chart_syms:
-        cols = st.columns(len(chart_syms))
-        for col, sym in zip(cols, chart_syms):
-            fig = candlestick(sym)
-            if fig is not None:
-                col.plotly_chart(fig, width="stretch", key=f"chart_{_sym_key(sym)}")
-                if col.button("🔍 크게 보기", key=f"zoom_btn_{_sym_key(sym)}", width="stretch"):
-                    st.session_state["pending_dialog"] = ("chart", sym)
-                    st.rerun()
+        mid = (len(chart_syms) + 1) // 2
+        for row_syms in (chart_syms[:mid], chart_syms[mid:]):
+            if not row_syms:
+                continue
+            cols = st.columns(len(row_syms))
+            for col, sym in zip(cols, row_syms):
+                _render_mini_chart(col, sym)
     else:
         st.caption("차트 데이터 수집 중…")
 
@@ -1183,8 +1433,6 @@ st.markdown("# 📊 바이낸스 USDⓈ-M 뉴스 트레이딩 봇 **Plus**")
 
 render_sidebar()
 
-# 다이얼로그는 메인 스크립트 범위에서 열어야 대시보드 자동 새로고침(fragment)에
-# 의해 닫히지 않는다. 버튼이 pending 플래그를 세팅한 뒤 전체 rerun → 여기서 1회 오픈.
 _pending = st.session_state.pop("pending_dialog", None)
 if _pending:
     _kind, _arg = _pending
@@ -1194,4 +1442,8 @@ if _pending:
     elif _kind == "stats":
         stats_dialog()
 
-render_dashboard()
+tab_live, tab_backtest = st.tabs(["📡 실시간", "📉 백테스트"])
+with tab_live:
+    render_dashboard()
+with tab_backtest:
+    render_backtest_tab()

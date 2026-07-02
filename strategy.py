@@ -5,6 +5,9 @@
   1. 고정 손절(Fixed Stop)
      진입가 대비 ``stop_loss_pct``% 만큼 불리하게 움직이면 즉시 **시장가** 청산.
 
+  1b. ATR 손절 (``stop_loss_mode=atr``)
+     진입 시점 ATR × ``stop_loss_atr_mult`` 거리에 손절 라인을 둔다.
+
   2. 동적 익절(Trailing Stop)
      **미실현 이익이 ``trailing_profit_pct``% 이상일 때만** 활성화된다.
      활성화 후 ``ATR * 3.0`` 거리에 익절 라인을 두고, 가격이 유리하게
@@ -113,7 +116,9 @@ class Position:
     leverage: int = field(default_factory=lambda: settings.leverage)
     margin: float = 0.0              # 사용 증거금(SIM 정산용, 트랜치 합산)
     added: bool = False              # 추가 진입(피라미딩) 1회 수행 여부
+    stop_loss_mode: str = field(default_factory=lambda: settings.stop_loss_mode)
     stop_loss_pct: float = field(default_factory=lambda: settings.stop_loss_pct)
+    stop_loss_atr_mult: float = field(default_factory=lambda: settings.stop_loss_atr_mult)
     atr_mult_base: float = field(default_factory=lambda: settings.trailing_atr_mult)
     atr_mult_tight: float = field(default_factory=lambda: settings.trailing_atr_mult_tight)
     trailing_profit_pct: float = field(default_factory=lambda: settings.trailing_profit_pct)
@@ -136,11 +141,22 @@ class Position:
         self.mark_price = self.entry_price
         self.highest_price = self.entry_price
         self.lowest_price = self.entry_price
+        self._set_stop_loss_price()
+        self.trailing_stop = self.entry_price
+
+    def _set_stop_loss_price(self) -> None:
+        """고정 % 또는 ATR 배수로 손절가를 설정한다."""
+        if self.stop_loss_mode == "atr" and self.atr > 0:
+            dist = self.atr * self.stop_loss_atr_mult
+            if self.side == "long":
+                self.stop_loss_price = self.entry_price - dist
+            else:
+                self.stop_loss_price = self.entry_price + dist
+            return
         if self.side == "long":
             self.stop_loss_price = self.entry_price * (1 - self.stop_loss_pct / 100)
         else:
             self.stop_loss_price = self.entry_price * (1 + self.stop_loss_pct / 100)
-        self.trailing_stop = self.entry_price
 
     def _profit_pct(self, mark_price: float) -> float:
         """현재가 기준 방향 반영 손익률(%)."""
@@ -167,10 +183,7 @@ class Position:
         self.trailing_active = False
         self.highest_price = max(self.entry_price, self.mark_price)
         self.lowest_price = min(self.entry_price, self.mark_price)
-        if self.side == "long":
-            self.stop_loss_price = self.entry_price * (1 - self.stop_loss_pct / 100)
-        else:
-            self.stop_loss_price = self.entry_price * (1 + self.stop_loss_pct / 100)
+        self._set_stop_loss_price()
         self.trailing_stop = self.entry_price
 
     def add_fill(
@@ -266,19 +279,29 @@ class Position:
                         self.trailing_stop, candidate, self.entry_price
                     )
 
-            # ---- 3) 고정 손절(시장가) ----
+            # ---- 3) 손절(시장가) ----
             if self.side == "long" and mark_price <= self.stop_loss_price:
+                sl_label = (
+                    f"ATR x{self.stop_loss_atr_mult:g}"
+                    if self.stop_loss_mode == "atr"
+                    else f"{self.stop_loss_pct}%"
+                )
                 return ExitSignal(
                     True,
-                    reason=f"fixed stop-loss hit ({self.stop_loss_pct}%): "
+                    reason=f"stop-loss hit ({sl_label}): "
                     f"{mark_price:.4f} <= {self.stop_loss_price:.4f}",
                     exit_type="stop_loss",
                     order_type="market",
                 )
             if self.side == "short" and mark_price >= self.stop_loss_price:
+                sl_label = (
+                    f"ATR x{self.stop_loss_atr_mult:g}"
+                    if self.stop_loss_mode == "atr"
+                    else f"{self.stop_loss_pct}%"
+                )
                 return ExitSignal(
                     True,
-                    reason=f"fixed stop-loss hit ({self.stop_loss_pct}%): "
+                    reason=f"stop-loss hit ({sl_label}): "
                     f"{mark_price:.4f} >= {self.stop_loss_price:.4f}",
                     exit_type="stop_loss",
                     order_type="market",

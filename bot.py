@@ -550,21 +550,14 @@ class TradingBot:
         return f"BB BREAKOUT {side.upper()}"
 
     def _log_bb_entry_fail(self, symbol: str, result) -> None:
-        """BB 돌파 평가 실패 시 진입 로그에 사유를 남긴다."""
-        if result.ok:
-            return
-        if result.reason == "BB_WIDTH":
-            self._emit_log(
-                "INFO", "entry",
-                f"BB 진입 실패 {symbol}: {BB_FAIL_LABELS['BB_WIDTH']} "
-                f"(bb_min={settings.bb_min}%)",
-            )
-            return
-        if not result.side or not result.reason:
+        """BB 돌파가 감지된 뒤 진입 조건 미충족 시에만 로그를 남긴다."""
+        if result.ok or not result.side or not result.reason:
             return
         detail = BB_FAIL_LABELS.get(result.reason, result.reason)
         extra = ""
-        if result.reason == "VOLUME" and result.volume_ratio is not None:
+        if result.reason == "BB_WIDTH":
+            extra = f" (bb_min={settings.bb_min}%)"
+        elif result.reason == "VOLUME" and result.volume_ratio is not None:
             extra = f" · ratio {result.volume_ratio:.2f} < {settings.vol_mult}"
         elif result.reason == "TREND":
             extra = (

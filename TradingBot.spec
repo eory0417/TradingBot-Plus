@@ -27,6 +27,9 @@ LOCAL_MODULES = [
     "finbert_paths.py",
     "http_session.py",
     "bb_breakout.py",
+    "backtest/__init__.py",
+    "backtest/engine.py",
+    "backtest/ui.py",
 ]
 
 datas = [
@@ -39,6 +42,7 @@ datas += [(name, ".") for name in LOCAL_MODULES]
 hiddenimports = list(collect_submodules("ccxt"))
 hiddenimports += list(collect_submodules("feedparser"))
 hiddenimports += list(collect_submodules("telethon"))
+hiddenimports += list(collect_submodules("backtest"))
 hiddenimports += [
     name.removesuffix(".py").replace("/", ".")
     for name in LOCAL_MODULES

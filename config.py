@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     # 뉴스 소스 모드: rss | coinnesskr | rss_coinnesskr | cryptopanic |
     # rss_coinnesskr_bb | bb_only.
     news_source_mode: str = Field(
-        default="rss_coinnesskr", alias="NEWS_SOURCE_MODE"
+        default="rss_coinnesskr_bb", alias="NEWS_SOURCE_MODE"
     )
     # 선택: 쉼표 구분 RSS URL 오버라이드(비어 있으면 기본 16+ 피드 목록).
     news_rss_feeds: str = Field(default="", alias="NEWS_RSS_FEEDS")
@@ -110,7 +110,7 @@ class Settings(BaseSettings):
     # 가변형 시장 지정가 주문의 체결 조건(IOC 또는 FOK).
     order_time_in_force: str = Field(default="IOC", alias="ORDER_TIME_IN_FORCE")
     # 1회 진입 명목 가치(USDT 기준).
-    position_size_usdt: float = Field(default=50.0, alias="POSITION_SIZE_USDT")
+    position_size_usdt: float = Field(default=100.0, alias="POSITION_SIZE_USDT")
     # 주문 레버리지 배수(자동 레버리지 비활성 시 사용하는 수동 값).
     leverage: int = Field(default=3, alias="LEVERAGE")
     # 자동 레버리지: True면 뉴스 점수 강도에 따라 레버리지를 결정한다.
@@ -119,36 +119,40 @@ class Settings(BaseSettings):
     margin_mode: str = Field(default="isolated", alias="MARGIN_MODE")
 
     # ---- 익절/손절 전략 (4단계) ----
-    # 고정 손절 비율(%). 진입가 대비 이 비율만큼 불리하게 움직이면 시장가 청산.
-    stop_loss_pct: float = Field(default=2.0, alias="STOP_LOSS_PCT")
+    # 손절 방식: fixed(진입가 대비 %) | atr(진입 ATR × 배수).
+    stop_loss_mode: str = Field(default="fixed", alias="STOP_LOSS_MODE")
+    # 고정 손절 비율(%). stop_loss_mode=fixed 일 때 사용.
+    stop_loss_pct: float = Field(default=2.5, alias="STOP_LOSS_PCT")
+    # ATR 손절 배수. stop_loss_mode=atr 일 때 진입 ATR × 배수.
+    stop_loss_atr_mult: float = Field(default=2.0, alias="STOP_LOSS_ATR_MULT")
     # 동적 익절(Trailing Stop) 기본 ATR 배수.
-    trailing_atr_mult: float = Field(default=2.5, alias="TRAILING_ATR_MULT")
+    trailing_atr_mult: float = Field(default=2.0, alias="TRAILING_ATR_MULT")
     # 강한 추세/뉴스 신호 발생 시 적용하는 축소된 ATR 배수(익절 라인을 바짝 당김).
     trailing_atr_mult_tight: float = Field(default=1.5, alias="TRAILING_ATR_MULT_TIGHT")
     # Trailing stop 활성화 최소 이익(%). 이 수익률 이상일 때만 트레일링 익절이 동작한다.
-    trailing_profit_pct: float = Field(default=1.5, alias="TRAILING_PROFIT_PCT")
+    trailing_profit_pct: float = Field(default=2.0, alias="TRAILING_PROFIT_PCT")
     # 실시간 뉴스 가중치 축소 트리거 임계값(긍정 0.7 / 부정 -0.7).
     news_score_threshold: float = Field(default=0.7, alias="NEWS_SCORE_THRESHOLD")
     # 횡보 시 시간 청산까지의 보유 시간(시간 단위).
-    time_exit_hours: float = Field(default=7.0, alias="TIME_EXIT_HOURS")
+    time_exit_hours: float = Field(default=5.0, alias="TIME_EXIT_HOURS")
     # 포지션 모니터링 주기(초).
     monitor_interval: int = Field(default=15, alias="MONITOR_INTERVAL")
 
     # ---- 볼린저 밴드 돌파 진입 (BBBQ) ----
     bb_len: int = Field(default=20, alias="BB_LEN")
-    bb_mult: float = Field(default=2.0, alias="BB_MULT")
-    bb_min: float = Field(default=1.0, alias="BB_MIN")
+    bb_mult: float = Field(default=3.2, alias="BB_MULT")
+    bb_min: float = Field(default=1.1, alias="BB_MIN")
     vol_mult: float = Field(default=1.5, alias="VOL_MULT")
-    vol_len: int = Field(default=20, alias="VOL_LEN")
-    f_trend_len: int = Field(default=5, alias="F_TREND_LEN")
+    vol_len: int = Field(default=15, alias="VOL_LEN")
+    f_trend_len: int = Field(default=3, alias="F_TREND_LEN")
     f_trend_pct: float = Field(default=0.25, alias="F_TREND_PCT")
-    min_range_pct: float = Field(default=0.08, alias="MIN_RANGE_PCT")
+    min_range_pct: float = Field(default=0.05, alias="MIN_RANGE_PCT")
     # BB 추세 필터: off(비활성) | relaxed(완화, 50% 동조) | strict(명세, 60% 동조).
-    bb_trend_mode: str = Field(default="relaxed", alias="BB_TREND_MODE")
+    bb_trend_mode: str = Field(default="off", alias="BB_TREND_MODE")
     # BB 최초 진입 레버리지(뉴스 LEVERAGE/AUTO_LEVERAGE 와 별도).
-    bb_leverage: int = Field(default=2, alias="BB_LEVERAGE")
-    # BB 추가 진입(피라미딩) 시 레버리지 상한.
-    bb_max_add_leverage: int = Field(default=10, alias="BB_MAX_ADD_LEVERAGE")
+    bb_leverage: int = Field(default=1, alias="BB_LEVERAGE")
+    # BB 추가 진입(피라미딩) 시 레버리지 상한. bb_leverage 와 같으면 피라미딩 OFF.
+    bb_max_add_leverage: int = Field(default=1, alias="BB_MAX_ADD_LEVERAGE")
 
     # ---- FinBERT 주기적 파인튜닝(재학습) ----
     # 자동 재학습 활성화 여부.
@@ -232,6 +236,14 @@ class Settings(BaseSettings):
         normalized = value.strip().lower()
         if normalized not in {"off", "relaxed", "strict"}:
             raise ValueError("BB_TREND_MODE must be 'off', 'relaxed', or 'strict'")
+        return normalized
+
+    @field_validator("stop_loss_mode")
+    @classmethod
+    def _validate_stop_loss_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"fixed", "atr"}:
+            raise ValueError("STOP_LOSS_MODE must be 'fixed' or 'atr'")
         return normalized
 
     @field_validator("news_source_mode")
