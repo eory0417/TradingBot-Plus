@@ -46,6 +46,7 @@ import pandas as pd
 import pandas_ta as ta
 
 from config import settings
+from derivatives_filter import DerivativesSnapshot
 from logger import format_exception_detail, get_logger, log_exception
 
 log = get_logger(__name__)
@@ -169,6 +170,8 @@ class TradingEngine:
         self.margin_mode = settings.margin_mode  # 'isolated' 또는 'cross'
         # 현재 보유 포지션: {심볼: 방향}. 동시 진입 카운터의 단일 출처.
         self._open_positions: dict[str, Side] = {}
+        # OI 변화율 계산용 캐시: {심볼: (open_interest, mono_ts)}
+        self._oi_cache: dict[str, tuple[float, float]] = {}
         # 카운터 경쟁 상태를 막기 위한 락(여러 코루틴이 동시 진입 시도 가능).
         self._lock = asyncio.Lock()
 
@@ -296,6 +299,148 @@ class TradingEngine:
             log_exception(log, exc, context="fetch_positions")
             return []
         return [p for p in positions if abs(float(p.get("contracts") or 0)) > 0]
+
+    async def fetch_derivatives_snapshot(self, symbol: str) -> DerivativesSnapshot:
+        """펀딩비·OI 스냅샷 (OI 변화율은 엔진 캐시 기준)."""
+        fr_pct = 0.0
+        oi = 0.0
+        oi_change = 0.0
+        ready = False
+        details_parts: list[str] = []
+        loop = asyncio.get_running_loop()
+
+        try:
+            fr_data = await self.exchange.fetch_funding_rate(symbol)
+            fr_raw = float(fr_data.get("fundingRate") or 0.0)
+            fr_pct = fr_raw * 100.0
+            details_parts.append(f"fr={fr_pct:.4f}%")
+        except Exception as exc:  # noqa: BLE001
+            log_exception(log, exc, context="fetch_funding_rate", symbol=symbol)
+            details_parts.append("fr=unavailable")
+
+        try:
+            oi_data = await self.exchange.fetch_open_interest(symbol)
+            oi = float(
+                oi_data.get("openInterestAmount")
+                or oi_data.get("openInterestValue")
+                or oi_data.get("openInterest")
+                or 0.0
+            )
+            prev = self._oi_cache.get(symbol)
+            if prev and prev[0] > 0 and oi > 0:
+                oi_change = (oi - prev[0]) / prev[0] * 100.0
+            self._oi_cache[symbol] = (oi, loop.time())
+            ready = oi > 0 or fr_pct != 0.0
+            details_parts.append(f"oi={oi:.0f} Δ{oi_change:+.1f}%")
+        except Exception as exc:  # noqa: BLE001
+            log_exception(log, exc, context="fetch_open_interest", symbol=symbol)
+            details_parts.append("oi=unavailable")
+
+        return DerivativesSnapshot(
+            funding_rate_pct=fr_pct,
+            open_interest=oi,
+            oi_change_pct=oi_change,
+            ready=ready,
+            details=" ".join(details_parts),
+        )
+
+    async def submit_maker_limit(
+        self,
+        symbol: str,
+        side: Side,
+        *,
+        leverage: int | None = None,
+        notional: float,
+        limit_price: float,
+    ) -> OrderResult:
+        """Post-only GTC 지정가 진입 (하이브리드 2차 체결용)."""
+        await self._prepare_symbol(symbol, leverage=leverage)
+        if limit_price <= 0 or notional <= 0:
+            return OrderResult(
+                symbol, side, "rejected", 0.0, 0.0, 0.0,
+                reason="invalid maker params",
+            )
+        order_side = "buy" if side == "long" else "sell"
+        raw_amount = notional / limit_price
+        try:
+            amount = float(self.exchange.amount_to_precision(symbol, raw_amount))
+            price = float(self.exchange.price_to_precision(symbol, limit_price))
+        except Exception:  # noqa: BLE001
+            amount = round(raw_amount, 6)
+            price = limit_price
+        params = {"timeInForce": "GTC", "postOnly": True}
+        try:
+            order = await self.exchange.create_order(
+                symbol, "limit", order_side, amount, price, params,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_exception(log, exc, context="maker_limit_entry", symbol=symbol, side=side)
+            return OrderResult(
+                symbol, side, "error", amount, 0.0, price,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+        order_id = order.get("id")
+        filled = float(order.get("filled") or 0.0)
+        status = (order.get("status") or "").lower()
+        if filled > 0:
+            fill_price = float(order.get("average") or order.get("price") or price)
+            st = "filled" if filled >= amount else "partial"
+            return OrderResult(
+                symbol, side, st, amount, filled, fill_price, order_id,
+                "maker limit filled", order,
+            )
+        if status in ("open", "new"):
+            return OrderResult(
+                symbol, side, "unfilled", amount, 0.0, price, order_id,
+                "maker limit resting", order,
+            )
+        return OrderResult(
+            symbol, side, "unfilled", amount, 0.0, price, order_id,
+            f"maker status={status}", order,
+        )
+
+    async def fetch_order_fill(
+        self, symbol: str, order_id: str,
+    ) -> OrderResult | None:
+        """대기 중인 지정가 주문 체결 상태 조회."""
+        if not order_id:
+            return None
+        try:
+            order = await self.exchange.fetch_order(order_id, symbol)
+        except Exception as exc:  # noqa: BLE001
+            log_exception(log, exc, context="fetch_order", symbol=symbol, order_id=order_id)
+            return None
+        side_raw = (order.get("side") or "").lower()
+        side: Side = "long" if side_raw == "buy" else "short"
+        requested = float(order.get("amount") or 0.0)
+        filled = float(order.get("filled") or 0.0)
+        price = float(order.get("average") or order.get("price") or 0.0)
+        status = (order.get("status") or "").lower()
+        if status == "closed" or (filled > 0 and filled >= requested):
+            st = "filled"
+        elif filled > 0:
+            st = "partial"
+        elif status in ("canceled", "cancelled", "expired", "rejected"):
+            st = "rejected"
+        else:
+            st = "unfilled"
+        return OrderResult(
+            symbol, side, st, requested, filled, price, order_id,
+            f"order status={status}", order,
+        )
+
+    async def cancel_order_safe(self, symbol: str, order_id: str | None) -> None:
+        """주문 취소(이미 종료된 경우 무시)."""
+        if not order_id:
+            return
+        try:
+            await self.exchange.cancel_order(order_id, symbol)
+            log.info("Order canceled | symbol=%s id=%s", symbol, order_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "Cancel skipped | symbol=%s id=%s | %s: %s",
+                symbol, order_id, type(exc).__name__, exc,
+            )
 
     async def flatten_all(self) -> list[str]:
         """거래소의 모든 오픈 포지션을 시장가(reduceOnly)로 청산한다.

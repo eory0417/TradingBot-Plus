@@ -31,12 +31,16 @@ import finetune
 from bb_breakout import BB_OHLCV_LIMIT, evaluate_bb_entry
 from config import settings
 from logger import format_exception_brief, get_logger, log_exception
+from derivatives_filter import gate_entry as deriv_gate_entry
 from mtf_filter import evaluate_mtf_from_frames, gate_entry, parse_mtf_tfs
 from news_analyzer import AnalyzedNews, NewsAnalyzer
+from news_category import category_exit_overrides, classify_news
 from news_weights import effective_news_score
+from pending_entry import PendingEntry
 from sizing import SizingState, compute_notional
 from state import STATE, NewsView, PositionView, ClosedChartView
 from strategy import ExitSignal, Position, Side
+from trade_log import record_trade
 from kst_util import format_kst
 from trading_engine import TradingEngine, compute_indicators_from_df, RSI_LENGTH, ATR_LENGTH
 from translator import translate_to_korean
@@ -218,6 +222,8 @@ class TradingBot:
         self._balance_poll_sec = 60.0
         self._sizing = SizingState()
         self._mtf_cache: dict[str, tuple[float, object]] = {}  # symbol -> (mono_ts, MtfTrend)
+        self._deriv_cache: dict[str, tuple[float, object]] = {}  # symbol -> (mono_ts, DerivativesSnapshot)
+        self._pending_entries: dict[str, PendingEntry] = {}
 
         # 모드별 구성.
         self.exchange = None
@@ -270,6 +276,7 @@ class TradingBot:
         self._running = False
         self.news.stop()
         self.positions.clear()
+        self._pending_entries.clear()
         self.state.clear_positions()
         self.state.pop_close_requests()
         self.state.set_running(False, status="stopped")
@@ -334,6 +341,10 @@ class TradingBot:
 
     async def _teardown(self) -> None:
         try:
+            if not self.sim and self.engine is not None:
+                for sym, pending in list(self._pending_entries.items()):
+                    await self.engine.cancel_order_safe(sym, pending.order_id)
+            self._pending_entries.clear()
             if self.exchange is not None:
                 from exchange import close_exchange
                 await close_exchange(self.exchange)
@@ -562,10 +573,16 @@ class TradingBot:
         if not ok:
             self._emit_log("INFO", "entry", f"진입 스킵 {symbol}: {mtf_reason}")
             return
+        ok, deriv_mult, deriv_reason = await self._deriv_gate(symbol, side)
+        if not ok:
+            self._emit_log("INFO", "entry", f"진입 스킵 {symbol}: {deriv_reason}")
+            return
 
+        category = classify_news(news, news_ko)
         await self._open(
             symbol, side, ind, news, score, leverage, news_triggered_at,
-            news_ko=news_ko, size_mult=mtf_mult,
+            news_ko=news_ko, size_mult=mtf_mult * deriv_mult,
+            use_hybrid=True, entry_category=category,
         )
 
     @staticmethod
@@ -664,11 +681,15 @@ class TradingBot:
         if not ok:
             self._emit_log("INFO", "entry", f"BB 진입 스킵 {symbol}: {mtf_reason}")
             return
+        ok, deriv_mult, deriv_reason = await self._deriv_gate(symbol, side)
+        if not ok:
+            self._emit_log("INFO", "entry", f"BB 진입 스킵 {symbol}: {deriv_reason}")
+            return
         label = self._bb_label(side)
         leverage = max(1, int(settings.bb_leverage))
         await self._open(
             symbol, side, ind, label, 0.0, leverage, _now(), news_ko="",
-            size_mult=mtf_mult,
+            size_mult=mtf_mult * deriv_mult, entry_category="bb_breakout",
         )
 
     async def _maybe_add_bb(
@@ -692,8 +713,12 @@ class TradingBot:
         if not ok:
             self._emit_log("INFO", "entry", f"BB 추가진입 스킵 {symbol}: {mtf_reason}")
             return
+        ok, deriv_mult, deriv_reason = await self._deriv_gate(symbol, side)
+        if not ok:
+            self._emit_log("INFO", "entry", f"BB 추가진입 스킵 {symbol}: {deriv_reason}")
+            return
         add_lev = min(pos.leverage + 1, settings.bb_max_add_leverage)
-        await self._add(pos, ind, label, 0.0, max(1, int(add_lev)), size_mult=mtf_mult)
+        await self._add(pos, ind, label, 0.0, max(1, int(add_lev)), size_mult=mtf_mult * deriv_mult)
 
     async def _mtf_gate(self, symbol: str, side: Side) -> tuple[bool, float, str]:
         """MTF EMA 필터. (허용, 사이즈배수, 사유)."""
@@ -724,6 +749,33 @@ class TradingBot:
             self._mtf_cache[symbol] = (now, trend)
         return gate_entry(side, trend, settings)
 
+    async def _deriv_gate(self, symbol: str, side: Side) -> tuple[bool, float, str]:
+        """펀딩·OI 필터. (허용, 사이즈배수, 사유)."""
+        if not settings.deriv_filter_enabled:
+            return True, 1.0, "deriv off"
+        if self.sim:
+            return True, 1.0, "deriv sim skip"
+        if self.engine is None:
+            return True, 1.0, "deriv no engine"
+        now = asyncio.get_running_loop().time()
+        cached = self._deriv_cache.get(symbol)
+        if cached and now - cached[0] < max(30, int(settings.oi_cache_sec)):
+            snap = cached[1]
+        else:
+            snap = await self.engine.fetch_derivatives_snapshot(symbol)
+            self._deriv_cache[symbol] = (now, snap)
+        return deriv_gate_entry(side, snap, settings)
+
+    async def _spike_range(self, symbol: str, ind) -> tuple[float, float]:
+        """하이브리드 눌림목용 최근 스파이크 고저."""
+        rows = await self._fetch_ohlcv_1m(symbol, limit=8)
+        if rows:
+            highs = [float(r[2]) for r in rows[-5:]]
+            lows = [float(r[3]) for r in rows[-5:]]
+            return max(highs), min(lows)
+        p = float(ind.last_price)
+        return p, p
+
     # ---- 진입 ----
     async def _open(
         self,
@@ -737,8 +789,9 @@ class TradingBot:
         *,
         news_ko: str = "",
         size_mult: float = 1.0,
+        use_hybrid: bool = False,
+        entry_category: str = "default",
     ) -> None:
-        # 실시간 설정 반영: 진입 시점의 명목금액을 사용(진입 후 스냅샷 고정).
         atr = ind.atr if ind.atr and not np.isnan(ind.atr) else ind.last_price * 0.01
         notional = compute_notional(
             settings.position_size_usdt,
@@ -750,16 +803,32 @@ class TradingBot:
         leverage = max(1, int(leverage))
         triggered = news_triggered_at or _now()
         price = ind.last_price
+
+        cat = entry_category
+        if cat == "default" and news.startswith("BB BREAKOUT"):
+            cat = "bb_breakout"
+        overrides = category_exit_overrides(cat)
+
+        hybrid_on = bool(use_hybrid and settings.hybrid_entry_enabled)
+        ioc_frac = float(settings.hybrid_ioc_fraction) if hybrid_on else 1.0
+        ioc_notional = notional * ioc_frac
+        maker_notional = notional - ioc_notional
+
+        order_price = price
+        filled = 0.0
+        ioc_filled_notional = ioc_notional
+
         if self.sim:
-            amount = notional / price
-            margin = notional / leverage
+            if ioc_notional <= 0:
+                return
+            filled = ioc_notional / price
+            margin = ioc_notional / leverage
             self.sim_market.balance -= margin
             self.state.set_balance(self.sim_market.balance)
             order_price = price
-            filled = amount
         else:
             result = await self.engine.enter_position(
-                symbol, side, leverage=leverage, notional=notional
+                symbol, side, leverage=leverage, notional=ioc_notional,
             )
             if not result.is_filled:
                 ctx = self._news_context(news, score, news_ko)
@@ -770,25 +839,48 @@ class TradingBot:
                 return
             order_price = result.price
             filled = result.filled_amount
+            ioc_filled_notional = filled * order_price if order_price else ioc_notional
 
         async with self._lock:
             pos = Position(
                 symbol=symbol, side=side, amount=filled, entry_price=order_price,
                 atr=atr,
                 entry_news=news, entry_news_ko=news_ko, entry_score=score,
+                entry_category=cat,
                 news_triggered_at=triggered,
-                notional=notional, leverage=leverage,
-                margin=notional / leverage,
+                notional=ioc_filled_notional, leverage=leverage,
+                margin=ioc_filled_notional / leverage,
+                **overrides,
             )
             pos.prev_rsi = ind.rsi
             self.positions[symbol] = pos
         self.state.clear_closed_chart(symbol)
 
         ctx = self._news_context(news, score, news_ko) if score or news_ko else news
+        hybrid_note = ""
+        if hybrid_on and maker_notional > 0:
+            spike_high, spike_low = await self._spike_range(symbol, ind)
+            pending = PendingEntry.from_spike(
+                symbol=symbol, side=side, leverage=leverage,
+                maker_notional=maker_notional,
+                spike_high=spike_high, spike_low=spike_low,
+                news=news, news_ko=news_ko, score=score, category=cat, atr=atr,
+            )
+            if not self.sim and self.engine is not None:
+                maker = await self.engine.submit_maker_limit(
+                    symbol, side, leverage=leverage,
+                    notional=maker_notional, limit_price=pending.limit_price,
+                )
+                pending.order_id = maker.order_id
+            self._pending_entries[symbol] = pending
+            hybrid_note = (
+                f" | hybrid IOC {ioc_frac * 100:.0f}% + maker @ {pending.limit_price:.4f}"
+            )
+        cat_note = f" | cat={cat}" if settings.news_category_tp_enabled else ""
         self._emit_log(
             "INFO", "entry",
             f"진입 {side.upper()} {symbol} | 진입가={order_price:.4f} 수량={filled:.6f} "
-            f"금액={notional:.2f}USDT 레버리지={leverage}x | {ctx}",
+            f"금액={ioc_filled_notional:.2f}USDT 레버리지={leverage}x{hybrid_note}{cat_note} | {ctx}",
         )
         self._sync_position_view(self.positions[symbol])
 
@@ -797,10 +889,9 @@ class TradingBot:
             self.state.set_balance(bal)
             self._last_balance_fetch = asyncio.get_running_loop().time()
 
-        # 텔레그램 알림(LIVE 모드, 실제 자격증명 시).
         if self.notifier is not None:
             await self.notifier.send_position_open(
-                symbol=symbol, side=side, amount_usdt=notional,
+                symbol=symbol, side=side, amount_usdt=ioc_filled_notional,
                 entry_price=order_price, news=news, score=score,
                 news_ko=news_ko, leverage=leverage,
             )
@@ -850,9 +941,13 @@ class TradingBot:
         if not ok:
             self._emit_log("INFO", "entry", f"추가진입 스킵 {symbol}: {mtf_reason}")
             return
+        ok, deriv_mult, deriv_reason = await self._deriv_gate(symbol, pos.side)
+        if not ok:
+            self._emit_log("INFO", "entry", f"추가진입 스킵 {symbol}: {deriv_reason}")
+            return
         await self._add(
             pos, ind, news, score, max(1, int(add_lev)),
-            news_ko=news_ko, size_mult=mtf_mult,
+            news_ko=news_ko, size_mult=mtf_mult * deriv_mult,
         )
 
     async def _add(
@@ -959,6 +1054,8 @@ class TradingBot:
             if settings.use_bb_entry:
                 await self._evaluate_bb_symbol(symbol, ind)
 
+            await self._monitor_pending_entry(symbol, ind)
+
             pos = self.positions.get(symbol)
             if pos is None:
                 continue
@@ -982,6 +1079,71 @@ class TradingBot:
                 self.state.set_balance(bal)
                 if bal_err:
                     self._emit_log("ERROR", "system", f"잔고 조회 실패: {bal_err}")
+
+    async def _monitor_pending_entry(self, symbol: str, ind) -> None:
+        """하이브리드 Maker 2차 체결 대기·만료 처리."""
+        pending = self._pending_entries.get(symbol)
+        if pending is None:
+            return
+        now = _now()
+        if pending.expired(now):
+            if not self.sim and self.engine is not None:
+                await self.engine.cancel_order_safe(symbol, pending.order_id)
+            self._pending_entries.pop(symbol, None)
+            self._emit_log(
+                "INFO", "entry",
+                f"하이브리드 Maker 만료 {symbol} @ {pending.limit_price:.4f}",
+            )
+            return
+
+        pos = self.positions.get(symbol)
+        if pos is None:
+            return
+
+        filled = False
+        fill_price = pending.limit_price
+        fill_amount = 0.0
+
+        if not self.sim and self.engine is not None and pending.order_id:
+            result = await self.engine.fetch_order_fill(symbol, pending.order_id)
+            if result and result.is_filled:
+                filled = True
+                fill_price = result.price or pending.limit_price
+                fill_amount = result.filled_amount
+        else:
+            mark = ind.last_price
+            touched = (
+                (pending.side == "long" and mark <= pending.limit_price)
+                or (pending.side == "short" and mark >= pending.limit_price)
+            )
+            if touched:
+                filled = True
+                fill_price = pending.limit_price
+                fill_amount = pending.maker_notional / fill_price
+
+        if not filled or fill_amount <= 0:
+            return
+
+        add_margin = pending.maker_notional / max(pending.leverage, 1)
+        if self.sim:
+            self.sim_market.balance -= add_margin
+            self.state.set_balance(self.sim_market.balance)
+
+        async with self._lock:
+            pos.add_fill(
+                add_amount=fill_amount, add_price=fill_price,
+                add_notional=pending.maker_notional, add_margin=add_margin,
+                leverage=pending.leverage, atr=pending.atr or pos.atr,
+            )
+        if not self.sim and self.engine is not None and pending.order_id:
+            await self.engine.cancel_order_safe(symbol, pending.order_id)
+        self._pending_entries.pop(symbol, None)
+        self._sync_position_view(pos)
+        self._emit_log(
+            "INFO", "entry",
+            f"하이브리드 Maker 체결 {pos.side.upper()} {symbol} | "
+            f"가={fill_price:.4f} +{fill_amount:.6f} 총={pos.notional:.2f}USDT",
+        )
 
     # ---- 청산 ----
     async def _close(self, pos: Position, signal) -> None:
@@ -1047,12 +1209,30 @@ class TradingBot:
                 "pnl_usdt": pnl_usdt,
                 "exit_type": "scale_out",
                 "partial": True,
+                "entry_category": pos.entry_category,
+            })
+            record_trade({
+                "symbol": pos.symbol,
+                "side": pos.side,
+                "leverage": pos.leverage,
+                "notional": close_notional,
+                "entry_price": pos.entry_price,
+                "exit_price": exit_price,
+                "pnl_pct": pnl_pct,
+                "pnl_usdt": pnl_usdt,
+                "exit_type": "scale_out",
+                "partial": True,
+                "entry_category": pos.entry_category,
             })
             if not self.sim and self.engine is not None:
                 bal, _ = await self.engine.fetch_balance_usdt()
                 self.state.set_balance(bal)
                 self._last_balance_fetch = asyncio.get_running_loop().time()
             return
+
+        pending = self._pending_entries.pop(pos.symbol, None)
+        if pending is not None and not self.sim and self.engine is not None:
+            await self.engine.cancel_order_safe(pos.symbol, pending.order_id)
 
         async with self._lock:
             self.positions.pop(pos.symbol, None)
@@ -1085,7 +1265,7 @@ class TradingBot:
             self._last_balance_fetch = asyncio.get_running_loop().time()
 
         # 수익률 통계용 거래 기록.
-        self.state.record_trade({
+        trade_row = {
             "symbol": pos.symbol,
             "side": pos.side,
             "leverage": pos.leverage,
@@ -1099,7 +1279,11 @@ class TradingBot:
             "opened_at": pos.opened_at.isoformat(),
             "closed_at": _now().isoformat(),
             "added": pos.added,
-        })
+            "entry_category": pos.entry_category,
+            "entry_news": pos.entry_news,
+        }
+        self.state.record_trade(trade_row)
+        record_trade(trade_row)
 
         ctx = self._news_context(pos.entry_news, pos.entry_score, pos.entry_news_ko)
         self._emit_log(

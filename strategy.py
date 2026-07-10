@@ -109,6 +109,7 @@ class Position:
     entry_news: str = ""
     entry_news_ko: str = ""
     entry_score: float = 0.0
+    entry_category: str = "default"
     news_triggered_at: datetime = field(default_factory=_now)
     order_id: Optional[str] = None
     opened_at: datetime = field(default_factory=_now)

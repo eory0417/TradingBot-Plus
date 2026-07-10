@@ -175,6 +175,26 @@ class Settings(BaseSettings):
     sizing_max_mult: float = Field(default=1.5, alias="SIZING_MAX_MULT")
     kelly_max_fraction: float = Field(default=1.0, alias="KELLY_MAX_FRACTION")
 
+    # ---- 선물 펀딩·OI 필터 ----
+    deriv_filter_enabled: bool = Field(default=True, alias="DERIV_FILTER_ENABLED")
+    deriv_mode: str = Field(default="reduce", alias="DERIV_MODE")  # block | reduce
+    deriv_reduce_mult: float = Field(default=0.5, alias="DERIV_REDUCE_MULT")
+    deriv_require_ready: bool = Field(default=False, alias="DERIV_REQUIRE_READY")
+    funding_long_block_pct: float = Field(default=0.05, alias="FUNDING_LONG_BLOCK_PCT")
+    funding_short_block_pct: float = Field(default=-0.05, alias="FUNDING_SHORT_BLOCK_PCT")
+    oi_spike_pct: float = Field(default=5.0, alias="OI_SPIKE_PCT")
+    oi_cache_sec: int = Field(default=300, alias="OI_CACHE_SEC")
+
+    # ---- 뉴스 카테고리별 청산 프로필 ----
+    news_category_tp_enabled: bool = Field(default=True, alias="NEWS_CATEGORY_TP_ENABLED")
+    news_category_exit_profiles: str = Field(default="", alias="NEWS_CATEGORY_EXIT_PROFILES")
+
+    # ---- 하이브리드 진입 (IOC + Maker 눌림목) — 뉴스 진입 전용 ----
+    hybrid_entry_enabled: bool = Field(default=False, alias="HYBRID_ENTRY_ENABLED")
+    hybrid_ioc_fraction: float = Field(default=0.3, alias="HYBRID_IOC_FRACTION")
+    hybrid_pullback_bps: float = Field(default=15.0, alias="HYBRID_PULLBACK_BPS")
+    hybrid_maker_wait_sec: int = Field(default=120, alias="HYBRID_MAKER_WAIT_SEC")
+
     # ---- 주문 재시도 / 스마트 진입 ----
     entry_retry_count: int = Field(default=2, alias="ENTRY_RETRY_COUNT")
     entry_retry_delay_ms: int = Field(default=300, alias="ENTRY_RETRY_DELAY_MS")
@@ -287,6 +307,21 @@ class Settings(BaseSettings):
         if normalized not in {"block", "reduce"}:
             raise ValueError("MTF_MODE must be 'block' or 'reduce'")
         return normalized
+
+    @field_validator("deriv_mode")
+    @classmethod
+    def _validate_deriv_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"block", "reduce"}:
+            raise ValueError("DERIV_MODE must be 'block' or 'reduce'")
+        return normalized
+
+    @field_validator("hybrid_ioc_fraction")
+    @classmethod
+    def _validate_hybrid_ioc_fraction(cls, value: float) -> float:
+        if not 0.05 <= value <= 0.95:
+            raise ValueError("HYBRID_IOC_FRACTION must be in [0.05, 0.95]")
+        return value
 
     @field_validator("sizing_mode")
     @classmethod

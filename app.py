@@ -500,6 +500,51 @@ def render_sidebar() -> None:
             "시장가 폴백", value=bool(settings.entry_fallback_market),
         )
 
+    with st.sidebar.expander("펀딩·카테고리·하이브리드", expanded=False):
+        settings.deriv_filter_enabled = st.checkbox(
+            "펀딩/OI 필터", value=bool(settings.deriv_filter_enabled),
+            help="과열 펀딩·OI 급증 시 역방향 진입 차단·축소",
+        )
+        if settings.deriv_filter_enabled:
+            deriv_modes = ("block", "reduce")
+            settings.deriv_mode = st.selectbox(
+                "펀딩 모드",
+                deriv_modes,
+                index=deriv_modes.index(settings.deriv_mode)
+                if settings.deriv_mode in deriv_modes else 0,
+                format_func=lambda k: {"block": "차단", "reduce": "비중축소"}[k],
+            )
+            settings.funding_long_block_pct = float(st.number_input(
+                "롱 차단 펀딩%≥", value=float(settings.funding_long_block_pct), step=0.01,
+            ))
+            settings.funding_short_block_pct = float(st.number_input(
+                "숏 차단 펀딩%≤", value=float(settings.funding_short_block_pct), step=0.01,
+            ))
+            settings.oi_spike_pct = float(st.number_input(
+                "OI 급증%≥", value=float(settings.oi_spike_pct), step=0.5,
+            ))
+        settings.news_category_tp_enabled = st.checkbox(
+            "카테고리별 청산", value=bool(settings.news_category_tp_enabled),
+            help="listing/hack/partnership 등 뉴스 유형별 TP·시간청산",
+        )
+        settings.hybrid_entry_enabled = st.checkbox(
+            "하이브리드 진입", value=bool(settings.hybrid_entry_enabled),
+            help="뉴스 진입: IOC 1차 + Maker 눌림목 2차 (BB 미적용)",
+        )
+        if settings.hybrid_entry_enabled:
+            settings.hybrid_ioc_fraction = float(st.number_input(
+                "IOC 비율", min_value=0.1, max_value=0.9,
+                value=float(settings.hybrid_ioc_fraction), step=0.05,
+            ))
+            settings.hybrid_pullback_bps = float(st.number_input(
+                "눌림 bps", min_value=5.0, max_value=100.0,
+                value=float(settings.hybrid_pullback_bps), step=1.0,
+            ))
+            settings.hybrid_maker_wait_sec = int(st.number_input(
+                "Maker 대기초", min_value=30, max_value=600,
+                value=int(settings.hybrid_maker_wait_sec), step=10,
+            ))
+
     settings.margin_mode = margin_mode
     settings.auto_leverage = bool(auto_leverage)
     settings.leverage = int(leverage)
