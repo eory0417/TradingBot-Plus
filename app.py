@@ -443,10 +443,61 @@ def render_sidebar() -> None:
             "Trail ATR", min_value=0.5, value=float(settings.trailing_atr_mult), step=0.5,
         )
 
-    r3c1, _r3c2 = st.sidebar.columns(2)
+    r3c1, r3c2 = st.sidebar.columns(2)
     with r3c1:
         time_exit = st.number_input(
             "시간청산 h", min_value=0.5, value=float(settings.time_exit_hours), step=0.5,
+        )
+    with r3c2:
+        settings.scale_out_enabled = st.checkbox(
+            "부분익절",
+            value=bool(settings.scale_out_enabled),
+            help="ATR×배수 도달 시 일부 익절 후 잔량 트레일",
+        )
+
+    with st.sidebar.expander("MTF / 사이징 / 주문", expanded=False):
+        settings.mtf_filter_enabled = st.checkbox(
+            "MTF 필터", value=bool(settings.mtf_filter_enabled),
+            help="1h/4h EMA로 역추세 진입 차단·축소",
+        )
+        mtf_modes = ("block", "reduce")
+        settings.mtf_mode = st.selectbox(
+            "MTF 모드",
+            mtf_modes,
+            index=mtf_modes.index(settings.mtf_mode) if settings.mtf_mode in mtf_modes else 0,
+            format_func=lambda k: {"block": "차단", "reduce": "비중축소"}[k],
+        )
+        settings.mtf_reduce_mult = float(st.number_input(
+            "MTF 축소배수", min_value=0.05, max_value=1.0,
+            value=float(settings.mtf_reduce_mult), step=0.05,
+        ))
+        size_modes = ("fixed", "vol", "vol_kelly")
+        settings.sizing_mode = st.selectbox(
+            "사이징",
+            size_modes,
+            index=size_modes.index(settings.sizing_mode) if settings.sizing_mode in size_modes else 0,
+            format_func=lambda k: {
+                "fixed": "고정", "vol": "변동성", "vol_kelly": "변동성+반켈리",
+            }[k],
+        )
+        if settings.scale_out_enabled:
+            settings.scale_out_fraction = float(st.number_input(
+                "부분익절 비율", min_value=0.1, max_value=0.9,
+                value=float(settings.scale_out_fraction), step=0.05,
+            ))
+            settings.scale_out_atr_mult = float(st.number_input(
+                "부분익절 ATR×", min_value=0.5, max_value=5.0,
+                value=float(settings.scale_out_atr_mult), step=0.1,
+            ))
+            settings.scale_out_move_be = st.checkbox(
+                "부분익절 후 본전손절", value=bool(settings.scale_out_move_be),
+            )
+        settings.entry_retry_count = int(st.number_input(
+            "IOC 재시도", min_value=0, max_value=5,
+            value=int(settings.entry_retry_count), step=1,
+        ))
+        settings.entry_fallback_market = st.checkbox(
+            "시장가 폴백", value=bool(settings.entry_fallback_market),
         )
 
     settings.margin_mode = margin_mode

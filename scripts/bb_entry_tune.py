@@ -92,7 +92,7 @@ def _load_symbol(sym: str, since: int, until: int) -> SymbolData:
         return payload
 
         print(f"  fetching {sym}...", flush=True)
-    df_1m, df_15m = fetch_backtest_frames(
+    df_1m, df_15m, _mtf = fetch_backtest_frames(
         sym, since_ms=since, until_ms=until, indicator_tf="15m", testnet=False,
     )
     rows = df_1m.to_numpy()

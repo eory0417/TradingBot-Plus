@@ -52,8 +52,10 @@ class ExitSignal:
 
     should_exit: bool
     reason: str = ""
-    exit_type: str = ""          # 'stop_loss' | 'trailing_stop' | 'time_exit'
+    exit_type: str = ""          # 'stop_loss' | 'trailing_stop' | 'time_exit' | 'scale_out'
     order_type: str = "market"   # 'market' | 'marketable_limit'
+    # None = 전량. 0 < f < 1 이면 해당 비율만 청산(부분 익절).
+    close_fraction: float | None = None
 
 
 def strong_rsi_cross_up(prev_rsi: Optional[float], rsi: float) -> bool:
@@ -124,6 +126,12 @@ class Position:
     trailing_profit_pct: float = field(default_factory=lambda: settings.trailing_profit_pct)
     news_threshold: float = field(default_factory=lambda: settings.news_score_threshold)
     time_exit_hours: float = field(default_factory=lambda: settings.time_exit_hours)
+    # Scale-out 스냅샷
+    scale_out_enabled: bool = field(default_factory=lambda: settings.scale_out_enabled)
+    scale_out_fraction: float = field(default_factory=lambda: settings.scale_out_fraction)
+    scale_out_atr_mult: float = field(default_factory=lambda: settings.scale_out_atr_mult)
+    scale_out_move_be: bool = field(default_factory=lambda: settings.scale_out_move_be)
+    scale_out_done: bool = False
 
     # 동적 상태(초기화 시 계산).
     stop_loss_price: float = 0.0
@@ -216,6 +224,26 @@ class Position:
         self.added = True
         self._recompute_lines()
 
+    def apply_scale_out(self, fraction: float) -> None:
+        """부분 익절 체결 후 잔량·손절을 갱신한다."""
+        frac = min(max(float(fraction), 0.0), 0.95)
+        remain = 1.0 - frac
+        if remain <= 0 or self.amount <= 0:
+            return
+        self.amount *= remain
+        self.notional *= remain
+        self.margin *= remain
+        self.scale_out_done = True
+        if self.scale_out_move_be:
+            # 본전(진입가)으로 손절 이동 — 추가 손실 차단
+            self.stop_loss_price = self.entry_price
+
+    def _scale_out_target_pct(self) -> float:
+        """ATR 배수 기반 목표가 수익률(%)."""
+        if self.entry_price <= 0 or self.atr <= 0:
+            return 0.0
+        return (self.atr * self.scale_out_atr_mult / self.entry_price) * 100.0
+
     # ---- 손익 ----
     def unrealized_pct(self) -> float:
         """현재가 기준 미실현 손익률(%)."""
@@ -277,6 +305,26 @@ class Position:
                     candidate = self.lowest_price + distance
                     self.trailing_stop = min(
                         self.trailing_stop, candidate, self.entry_price
+                    )
+
+            # ---- 2.5) Scale-out: ATR 목표가 도달 시 1회 부분 익절 ----
+            if (
+                self.scale_out_enabled
+                and not self.scale_out_done
+                and 0.05 <= self.scale_out_fraction < 1.0
+            ):
+                target_pct = self._scale_out_target_pct()
+                if target_pct > 0 and self._profit_pct(mark_price) >= target_pct:
+                    return ExitSignal(
+                        True,
+                        reason=(
+                            f"scale-out TP1: profit {self._profit_pct(mark_price):.2f}% "
+                            f">= ATR×{self.scale_out_atr_mult:g} ({target_pct:.2f}%) "
+                            f"→ close {self.scale_out_fraction * 100:.0f}%"
+                        ),
+                        exit_type="scale_out",
+                        order_type="market",
+                        close_fraction=self.scale_out_fraction,
                     )
 
             # ---- 3) 손절(시장가) ----

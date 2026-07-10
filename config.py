@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     # 손절 방식: fixed(진입가 대비 %) | atr(진입 ATR × 배수).
     stop_loss_mode: str = Field(default="fixed", alias="STOP_LOSS_MODE")
     # 고정 손절 비율(%). stop_loss_mode=fixed 일 때 사용.
-    stop_loss_pct: float = Field(default=2.5, alias="STOP_LOSS_PCT")
+    stop_loss_pct: float = Field(default=2.0, alias="STOP_LOSS_PCT")
     # ATR 손절 배수. stop_loss_mode=atr 일 때 진입 ATR × 배수.
     stop_loss_atr_mult: float = Field(default=2.0, alias="STOP_LOSS_ATR_MULT")
     # 동적 익절(Trailing Stop) 기본 ATR 배수.
@@ -130,29 +130,63 @@ class Settings(BaseSettings):
     # 강한 추세/뉴스 신호 발생 시 적용하는 축소된 ATR 배수(익절 라인을 바짝 당김).
     trailing_atr_mult_tight: float = Field(default=1.5, alias="TRAILING_ATR_MULT_TIGHT")
     # Trailing stop 활성화 최소 이익(%). 이 수익률 이상일 때만 트레일링 익절이 동작한다.
-    trailing_profit_pct: float = Field(default=2.0, alias="TRAILING_PROFIT_PCT")
+    trailing_profit_pct: float = Field(default=1.0, alias="TRAILING_PROFIT_PCT")
     # 실시간 뉴스 가중치 축소 트리거 임계값(긍정 0.7 / 부정 -0.7).
     news_score_threshold: float = Field(default=0.7, alias="NEWS_SCORE_THRESHOLD")
     # 횡보 시 시간 청산까지의 보유 시간(시간 단위).
-    time_exit_hours: float = Field(default=5.0, alias="TIME_EXIT_HOURS")
+    time_exit_hours: float = Field(default=3.0, alias="TIME_EXIT_HOURS")
     # 포지션 모니터링 주기(초).
     monitor_interval: int = Field(default=15, alias="MONITOR_INTERVAL")
 
     # ---- 볼린저 밴드 돌파 진입 (BBBQ) ----
-    bb_len: int = Field(default=20, alias="BB_LEN")
-    bb_mult: float = Field(default=3.2, alias="BB_MULT")
-    bb_min: float = Field(default=1.1, alias="BB_MIN")
+    bb_len: int = Field(default=18, alias="BB_LEN")
+    bb_mult: float = Field(default=3.7, alias="BB_MULT")
+    bb_min: float = Field(default=0.7, alias="BB_MIN")
     vol_mult: float = Field(default=1.5, alias="VOL_MULT")
     vol_len: int = Field(default=15, alias="VOL_LEN")
-    f_trend_len: int = Field(default=3, alias="F_TREND_LEN")
-    f_trend_pct: float = Field(default=0.25, alias="F_TREND_PCT")
+    f_trend_len: int = Field(default=5, alias="F_TREND_LEN")
+    f_trend_pct: float = Field(default=0.15, alias="F_TREND_PCT")
     min_range_pct: float = Field(default=0.05, alias="MIN_RANGE_PCT")
     # BB 추세 필터: off(비활성) | relaxed(완화, 50% 동조) | strict(명세, 60% 동조).
-    bb_trend_mode: str = Field(default="off", alias="BB_TREND_MODE")
+    bb_trend_mode: str = Field(default="relaxed", alias="BB_TREND_MODE")
     # BB 최초 진입 레버리지(뉴스 LEVERAGE/AUTO_LEVERAGE 와 별도).
     bb_leverage: int = Field(default=1, alias="BB_LEVERAGE")
     # BB 추가 진입(피라미딩) 시 레버리지 상한. bb_leverage 와 같으면 피라미딩 OFF.
     bb_max_add_leverage: int = Field(default=1, alias="BB_MAX_ADD_LEVERAGE")
+
+    # ---- MTF 추세 필터 ----
+    mtf_filter_enabled: bool = Field(default=True, alias="MTF_FILTER_ENABLED")
+    mtf_tfs: str = Field(default="1h,4h", alias="MTF_TFS")
+    mtf_ema_len: int = Field(default=200, alias="MTF_EMA_LEN")
+    mtf_mode: str = Field(default="reduce", alias="MTF_MODE")  # block | reduce
+    mtf_reduce_mult: float = Field(default=0.3, alias="MTF_REDUCE_MULT")
+    mtf_require_ready: bool = Field(default=False, alias="MTF_REQUIRE_READY")
+
+    # ---- Scale-out (부분 익절) ----
+    scale_out_enabled: bool = Field(default=True, alias="SCALE_OUT_ENABLED")
+    scale_out_fraction: float = Field(default=0.4, alias="SCALE_OUT_FRACTION")
+    scale_out_atr_mult: float = Field(default=1.5, alias="SCALE_OUT_ATR_MULT")
+    scale_out_move_be: bool = Field(default=True, alias="SCALE_OUT_MOVE_BE")
+
+    # ---- 포지션 사이징 (fixed | vol | vol_kelly) ----
+    sizing_mode: str = Field(default="vol", alias="SIZING_MODE")
+    vol_target_atr_pct: float = Field(default=0.8, alias="VOL_TARGET_ATR_PCT")
+    sizing_min_mult: float = Field(default=0.4, alias="SIZING_MIN_MULT")
+    sizing_max_mult: float = Field(default=1.5, alias="SIZING_MAX_MULT")
+    kelly_max_fraction: float = Field(default=1.0, alias="KELLY_MAX_FRACTION")
+
+    # ---- 주문 재시도 / 스마트 진입 ----
+    entry_retry_count: int = Field(default=2, alias="ENTRY_RETRY_COUNT")
+    entry_retry_delay_ms: int = Field(default=300, alias="ENTRY_RETRY_DELAY_MS")
+    entry_fallback_market: bool = Field(default=True, alias="ENTRY_FALLBACK_MARKET")
+    entry_chase_bps: float = Field(default=5.0, alias="ENTRY_CHASE_BPS")
+
+    # ---- 뉴스 소스·키워드 가중치 (JSON 문자열) ----
+    news_source_weights: str = Field(
+        default='{"default":1.0,"coinness":1.0,"coinnessgl":1.0}',
+        alias="NEWS_SOURCE_WEIGHTS",
+    )
+    news_keyword_boost: str = Field(default="{}", alias="NEWS_KEYWORD_BOOST")
 
     # ---- FinBERT 주기적 파인튜닝(재학습) ----
     # 자동 재학습 활성화 여부.
@@ -245,6 +279,29 @@ class Settings(BaseSettings):
         if normalized not in {"fixed", "atr"}:
             raise ValueError("STOP_LOSS_MODE must be 'fixed' or 'atr'")
         return normalized
+
+    @field_validator("mtf_mode")
+    @classmethod
+    def _validate_mtf_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"block", "reduce"}:
+            raise ValueError("MTF_MODE must be 'block' or 'reduce'")
+        return normalized
+
+    @field_validator("sizing_mode")
+    @classmethod
+    def _validate_sizing_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"fixed", "vol", "vol_kelly"}:
+            raise ValueError("SIZING_MODE must be 'fixed', 'vol', or 'vol_kelly'")
+        return normalized
+
+    @field_validator("scale_out_fraction")
+    @classmethod
+    def _validate_scale_out_fraction(cls, value: float) -> float:
+        if not 0.05 <= value < 1.0:
+            raise ValueError("SCALE_OUT_FRACTION must be in [0.05, 1.0)")
+        return value
 
     @field_validator("news_source_mode")
     @classmethod

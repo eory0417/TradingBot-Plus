@@ -11,6 +11,8 @@ import pandas as pd
 
 from bb_breakout import BB_OHLCV_LIMIT, evaluate_bb_entry
 from config import Settings, settings as default_settings
+from mtf_filter import gate_entry, parse_mtf_tfs
+from sizing import SizingState, compute_notional
 from strategy import Position
 from trading_engine import compute_indicators_from_df
 
@@ -20,6 +22,7 @@ _EXIT_LABELS = {
     "stop_loss": "손절",
     "trailing_stop": "트레일링",
     "time_exit": "시간청산",
+    "scale_out": "부분익절",
 }
 
 _TF_MS = {
@@ -162,6 +165,72 @@ def _pyramid_enabled(cfg: Settings) -> bool:
     return int(cfg.bb_max_add_leverage) > int(cfg.bb_leverage)
 
 
+def _precompute_mtf_bias_series(
+    mtf_frames: dict[str, pd.DataFrame],
+    timestamps_1m: np.ndarray,
+    *,
+    ema_len: int,
+) -> list:
+    """1m 각 봉에 대응하는 MTF bias를 포인터 전진으로 미리 계산 (O(n))."""
+    from mtf_filter import MtfTrend, bias_from_close_ema, combine_biases
+
+    if not mtf_frames:
+        return [MtfTrend(bias="neutral", ready=False, details="")] * len(timestamps_1m)
+
+    # TF별: timestamp, close, rolling ema series
+    tf_state: dict[str, dict] = {}
+    for tf, df in mtf_frames.items():
+        if df is None or df.empty:
+            continue
+        ts = df["timestamp"].to_numpy(dtype=np.int64)
+        closes = df["close"].to_numpy(dtype=float)
+        s = pd.Series(closes)
+        ema200 = s.ewm(span=ema_len, adjust=False).mean().to_numpy(dtype=float)
+        ema50 = s.ewm(span=50, adjust=False).mean().to_numpy(dtype=float)
+        tf_state[tf] = {
+            "ts": ts,
+            "close": closes,
+            "ema200": ema200,
+            "ema50": ema50,
+            "idx": -1,
+        }
+
+    out: list = []
+    for t in timestamps_1m:
+        biases = []
+        parts = []
+        ready_count = 0
+        for tf, st in tf_state.items():
+            idx = st["idx"]
+            ts_arr = st["ts"]
+            while idx + 1 < len(ts_arr) and ts_arr[idx + 1] <= t:
+                idx += 1
+            st["idx"] = idx
+            if idx < 0:
+                continue
+            close = float(st["close"][idx])
+            use_ema = float(st["ema200"][idx])
+            ready = idx + 1 >= ema_len
+            if not ready:
+                use_ema = float(st["ema50"][idx])
+            else:
+                ready_count += 1
+            b = bias_from_close_ema(close, use_ema)
+            biases.append(b)
+            parts.append(f"{tf}:{b}")
+        if not biases:
+            out.append(MtfTrend(bias="neutral", ready=False, details=""))
+        else:
+            out.append(
+                MtfTrend(
+                    bias=combine_biases(biases),
+                    ready=ready_count == len(tf_state),
+                    details="; ".join(parts),
+                )
+            )
+    return out
+
+
 def run_backtest(
     df_1m: pd.DataFrame,
     df_15m: pd.DataFrame,
@@ -172,11 +241,13 @@ def run_backtest(
     costs: BacktestCosts | None = None,
     trade_start_ms: int = 0,
     trade_end_ms: int = 0,
+    mtf_frames: dict[str, pd.DataFrame] | None = None,
 ) -> BacktestResult:
     """1m BB 진입 + 15m 지표 청산 시뮬레이션 (뉴스 진입 제외)."""
     cfg = cfg or default_settings
     costs = costs or BacktestCosts()
     tf = cfg.timeframe
+    sizing_state = SizingState()
 
     if df_1m.empty:
         return BacktestResult(initial_capital=initial_capital, symbol=symbol)
@@ -195,6 +266,15 @@ def run_backtest(
     rows_1m = frame.to_numpy()
     last_entry_bar: int | None = None
     rejects = EntryRejectStats()
+    mtf_frames = mtf_frames or {}
+    mtf_series = (
+        _precompute_mtf_bias_series(
+            mtf_frames, frame["timestamp"].to_numpy(dtype=np.int64),
+            ema_len=cfg.mtf_ema_len,
+        )
+        if cfg.mtf_filter_enabled and mtf_frames
+        else None
+    )
 
     for i in range(len(frame)):
         row = rows_1m[i]
@@ -218,11 +298,23 @@ def run_backtest(
                 exit_px = _apply_slippage(
                     close, position.side, is_entry=False, slip_pct=costs.slippage_pct,
                 )
+                position.mark_price = exit_px
+                frac = sig.close_fraction
+                is_partial = (
+                    sig.exit_type == "scale_out"
+                    and frac is not None
+                    and 0.05 <= float(frac) < 1.0
+                    and not position.scale_out_done
+                )
+                close_notional = position.notional * float(frac) if is_partial else position.notional
+                close_margin = (
+                    position.margin * float(frac) if is_partial else position.margin
+                )
                 pnl_pct = position.unrealized_pct()
-                gross_pnl = position.margin * (pnl_pct / 100) * position.leverage
-                exit_fee = _fee_usdt(position.notional, costs.fee_pct)
+                gross_pnl = close_margin * (pnl_pct / 100) * position.leverage
+                exit_fee = _fee_usdt(close_notional, costs.fee_pct)
                 net_pnl = gross_pnl - exit_fee
-                free += position.margin + net_pnl
+                free += close_margin + net_pnl
                 trades.append(
                     Trade(
                         symbol=symbol,
@@ -239,7 +331,11 @@ def run_backtest(
                         exit_type=sig.exit_type,
                     )
                 )
-                position = None
+                sizing_state.stats.record(pnl_pct)
+                if is_partial:
+                    position.apply_scale_out(float(frac))
+                else:
+                    position = None
 
         if in_range and i >= BB_OHLCV_LIMIT - 1:
             rejects.bars_evaluated += 1
@@ -262,35 +358,53 @@ def run_backtest(
                     if ind is None:
                         rejects.ind_missing += 1
                     elif last_entry_bar != ts:
-                        lev = max(1, int(cfg.bb_leverage))
-                        notional = float(cfg.position_size_usdt)
-                        margin = notional / lev
-                        if free >= margin:
-                            rejects.entered += 1
-                            entry_px = _apply_slippage(
-                                close, result.side, is_entry=True, slip_pct=costs.slippage_pct,
+                        mtf_mult = 1.0
+                        mtf_ok = True
+                        if mtf_series is not None:
+                            trend = mtf_series[i]
+                            mtf_ok, mtf_mult, _reason = gate_entry(result.side, trend, cfg)
+                        if mtf_ok:
+                            lev = max(1, int(cfg.bb_leverage))
+                            atr = ind.atr if ind.atr > 0 else close * 0.01
+                            notional = compute_notional(
+                                float(cfg.position_size_usdt),
+                                atr=atr,
+                                price=close,
+                                cfg=cfg,
+                                sizing_state=sizing_state,
+                                extra_mult=mtf_mult,
                             )
-                            entry_fee = _fee_usdt(notional, costs.fee_pct)
-                            free -= margin + entry_fee
-                            position = Position(
-                                symbol=symbol,
-                                side=result.side,
-                                amount=notional / entry_px,
-                                entry_price=entry_px,
-                                atr=ind.atr if ind.atr > 0 else entry_px * 0.01,
-                                opened_at=datetime.fromtimestamp(ts / 1000, tz=timezone.utc),
-                                notional=notional,
-                                leverage=lev,
-                                margin=margin,
-                                stop_loss_mode=cfg.stop_loss_mode,
-                                stop_loss_pct=cfg.stop_loss_pct,
-                                stop_loss_atr_mult=cfg.stop_loss_atr_mult,
-                                atr_mult_base=cfg.trailing_atr_mult,
-                                atr_mult_tight=cfg.trailing_atr_mult_tight,
-                                trailing_profit_pct=cfg.trailing_profit_pct,
-                                time_exit_hours=cfg.time_exit_hours,
-                            )
-                            last_entry_bar = ts
+                            margin = notional / lev
+                            if free >= margin:
+                                rejects.entered += 1
+                                entry_px = _apply_slippage(
+                                    close, result.side, is_entry=True, slip_pct=costs.slippage_pct,
+                                )
+                                entry_fee = _fee_usdt(notional, costs.fee_pct)
+                                free -= margin + entry_fee
+                                position = Position(
+                                    symbol=symbol,
+                                    side=result.side,
+                                    amount=notional / entry_px,
+                                    entry_price=entry_px,
+                                    atr=atr,
+                                    opened_at=datetime.fromtimestamp(ts / 1000, tz=timezone.utc),
+                                    notional=notional,
+                                    leverage=lev,
+                                    margin=margin,
+                                    stop_loss_mode=cfg.stop_loss_mode,
+                                    stop_loss_pct=cfg.stop_loss_pct,
+                                    stop_loss_atr_mult=cfg.stop_loss_atr_mult,
+                                    atr_mult_base=cfg.trailing_atr_mult,
+                                    atr_mult_tight=cfg.trailing_atr_mult_tight,
+                                    trailing_profit_pct=cfg.trailing_profit_pct,
+                                    time_exit_hours=cfg.time_exit_hours,
+                                    scale_out_enabled=cfg.scale_out_enabled,
+                                    scale_out_fraction=cfg.scale_out_fraction,
+                                    scale_out_atr_mult=cfg.scale_out_atr_mult,
+                                    scale_out_move_be=cfg.scale_out_move_be,
+                                )
+                                last_entry_bar = ts
                 elif (
                     _pyramid_enabled(cfg)
                     and not position.added
@@ -302,25 +416,39 @@ def run_backtest(
                         or (position.side == "short" and ind.last_price < position.entry_price)
                     )
                     if favorable and last_entry_bar != ts:
-                        add_lev = min(position.leverage + 1, int(cfg.bb_max_add_leverage))
-                        add_notional = float(cfg.position_size_usdt)
-                        add_margin = add_notional / add_lev
-                        if free >= add_margin:
-                            add_px = _apply_slippage(
-                                close, position.side, is_entry=True, slip_pct=costs.slippage_pct,
+                        mtf_mult = 1.0
+                        mtf_ok = True
+                        if mtf_series is not None:
+                            trend = mtf_series[i]
+                            mtf_ok, mtf_mult, _reason = gate_entry(result.side, trend, cfg)
+                        if mtf_ok:
+                            add_lev = min(position.leverage + 1, int(cfg.bb_max_add_leverage))
+                            atr = ind.atr if ind.atr > 0 else close * 0.01
+                            add_notional = compute_notional(
+                                float(cfg.position_size_usdt),
+                                atr=atr,
+                                price=close,
+                                cfg=cfg,
+                                sizing_state=sizing_state,
+                                extra_mult=mtf_mult,
                             )
-                            add_fee = _fee_usdt(add_notional, costs.fee_pct)
-                            free -= add_margin + add_fee
-                            add_amount = add_notional / add_px
-                            position.add_fill(
-                                add_amount=add_amount,
-                                add_price=add_px,
-                                add_notional=add_notional,
-                                add_margin=add_margin,
-                                leverage=add_lev,
-                                atr=ind.atr,
-                            )
-                            last_entry_bar = ts
+                            add_margin = add_notional / add_lev
+                            if free >= add_margin:
+                                add_px = _apply_slippage(
+                                    close, position.side, is_entry=True, slip_pct=costs.slippage_pct,
+                                )
+                                add_fee = _fee_usdt(add_notional, costs.fee_pct)
+                                free -= add_margin + add_fee
+                                add_amount = add_notional / add_px
+                                position.add_fill(
+                                    add_amount=add_amount,
+                                    add_price=add_px,
+                                    add_notional=add_notional,
+                                    add_margin=add_margin,
+                                    leverage=add_lev,
+                                    atr=atr,
+                                )
+                                last_entry_bar = ts
 
         mark_eq = free
         if position is not None:
@@ -449,8 +577,10 @@ def fetch_backtest_frames(
     until_ms: int,
     indicator_tf: str,
     testnet: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """1m(진입) + 지표 타임프레임 OHLCV를 워밍업 포함해 조회한다."""
+    mtf_tfs: list[str] | None = None,
+    mtf_ema_len: int = 200,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
+    """1m(진입) + 지표 TF + (선택) MTF OHLCV를 워밍업 포함해 조회한다."""
     warmup_1m = BB_OHLCV_LIMIT + 20
     tf_ms = _TF_MS.get(indicator_tf, 900_000)
     warmup_15m = max(60, int(20 * tf_ms / 60_000))
@@ -468,4 +598,13 @@ def fetch_backtest_frames(
         symbol, indicator_tf, since_ms=since_ind, until_ms=until_ms,
         max_bars=need_ind, testnet=testnet,
     )
-    return df_1m, df_ind
+    mtf: dict[str, pd.DataFrame] = {}
+    for tf in (mtf_tfs or []):
+        bar_ms = _TF_MS.get(tf, 3_600_000)
+        since_mtf = since_ms - max(mtf_ema_len + 20, 80) * bar_ms
+        need = _cap_max_bars(_bars_for_span(since_mtf, until_ms, bar_ms=bar_ms), absolute=20_000)
+        mtf[tf] = fetch_ohlcv_range(
+            symbol, tf, since_ms=since_mtf, until_ms=until_ms,
+            max_bars=need, testnet=testnet,
+        )
+    return df_1m, df_ind, mtf

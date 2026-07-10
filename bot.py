@@ -31,7 +31,10 @@ import finetune
 from bb_breakout import BB_OHLCV_LIMIT, evaluate_bb_entry
 from config import settings
 from logger import format_exception_brief, get_logger, log_exception
+from mtf_filter import evaluate_mtf_from_frames, gate_entry, parse_mtf_tfs
 from news_analyzer import AnalyzedNews, NewsAnalyzer
+from news_weights import effective_news_score
+from sizing import SizingState, compute_notional
 from state import STATE, NewsView, PositionView, ClosedChartView
 from strategy import ExitSignal, Position, Side
 from kst_util import format_kst
@@ -213,6 +216,8 @@ class TradingBot:
         self._bb_last_bar_ts: dict[str, int] = {}
         self._last_balance_fetch: float = 0.0
         self._balance_poll_sec = 60.0
+        self._sizing = SizingState()
+        self._mtf_cache: dict[str, tuple[float, object]] = {}  # symbol -> (mono_ts, MtfTrend)
 
         # 모드별 구성.
         self.exchange = None
@@ -461,7 +466,19 @@ class TradingBot:
             self._latest_news[sym] = (item.title, item.score)
 
         # 강한 감성 뉴스만 진입 평가·우측 로그(임계값 미만·neutral 등은 로그 생략).
-        if abs(item.score) < settings.news_score_threshold:
+        # 소스·키워드 가중치를 반영한 실효 점수로 임계값 비교.
+        scored_syms: list[tuple[str, float]] = []
+        for sym in symbols:
+            eff = effective_news_score(
+                item.score,
+                source=item.item.source,
+                symbol=sym,
+                title=title_en,
+                title_ko=title_ko,
+            )
+            if abs(eff) >= settings.news_score_threshold:
+                scored_syms.append((sym, eff))
+        if not scored_syms:
             return
         if not symbols:
             return
@@ -481,12 +498,12 @@ class TradingBot:
                 f"{self._format_bilingual(title_en, title_ko, item.score)}",
             )
             return
-        for sym in symbols:
+        for sym, eff_score in scored_syms:
             if sym in self.positions:
-                await self._maybe_add(sym, title_en, item.score, title_ko)
+                await self._maybe_add(sym, title_en, eff_score, title_ko)
             else:
                 await self._maybe_enter(
-                    sym, title_en, item.score, triggered_at, news_ko=title_ko,
+                    sym, title_en, eff_score, triggered_at, news_ko=title_ko,
                 )
 
     async def _maybe_enter(
@@ -541,8 +558,14 @@ class TradingBot:
                 return
             leverage = settings.leverage
 
+        ok, mtf_mult, mtf_reason = await self._mtf_gate(symbol, side)
+        if not ok:
+            self._emit_log("INFO", "entry", f"진입 스킵 {symbol}: {mtf_reason}")
+            return
+
         await self._open(
-            symbol, side, ind, news, score, leverage, news_triggered_at, news_ko=news_ko,
+            symbol, side, ind, news, score, leverage, news_triggered_at,
+            news_ko=news_ko, size_mult=mtf_mult,
         )
 
     @staticmethod
@@ -637,10 +660,15 @@ class TradingBot:
                 )
                 return
 
+        ok, mtf_mult, mtf_reason = await self._mtf_gate(symbol, side)
+        if not ok:
+            self._emit_log("INFO", "entry", f"BB 진입 스킵 {symbol}: {mtf_reason}")
+            return
         label = self._bb_label(side)
         leverage = max(1, int(settings.bb_leverage))
         await self._open(
             symbol, side, ind, label, 0.0, leverage, _now(), news_ko="",
+            size_mult=mtf_mult,
         )
 
     async def _maybe_add_bb(
@@ -660,8 +688,41 @@ class TradingBot:
                 f"평균 {pos.entry_price:.4f}) | {label}",
             )
             return
+        ok, mtf_mult, mtf_reason = await self._mtf_gate(symbol, side)
+        if not ok:
+            self._emit_log("INFO", "entry", f"BB 추가진입 스킵 {symbol}: {mtf_reason}")
+            return
         add_lev = min(pos.leverage + 1, settings.bb_max_add_leverage)
-        await self._add(pos, ind, label, 0.0, max(1, int(add_lev)))
+        await self._add(pos, ind, label, 0.0, max(1, int(add_lev)), size_mult=mtf_mult)
+
+    async def _mtf_gate(self, symbol: str, side: Side) -> tuple[bool, float, str]:
+        """MTF EMA 필터. (허용, 사이즈배수, 사유)."""
+        if not settings.mtf_filter_enabled:
+            return True, 1.0, "mtf off"
+        now = asyncio.get_running_loop().time()
+        cached = self._mtf_cache.get(symbol)
+        if cached and now - cached[0] < 60.0:
+            trend = cached[1]
+        else:
+            tfs = parse_mtf_tfs(settings.mtf_tfs)
+            if self.sim and self.sim_market is not None:
+                # SIM: 1m 합성 종가를 상위 TF로 간주해 동일 시리즈 사용
+                rows = self.sim_market.ohlcv(symbol, limit=max(settings.mtf_ema_len + 20, 80))
+                df = pd.DataFrame(
+                    rows, columns=["timestamp", "open", "high", "low", "close", "volume"],
+                )
+                frames = {tf: df for tf in tfs}
+            elif self.engine is not None:
+                frames = await self.engine.fetch_mtf_frames(
+                    symbol, tfs, ema_len=settings.mtf_ema_len,
+                )
+            else:
+                return True, 1.0, "mtf no engine"
+            trend = evaluate_mtf_from_frames(
+                frames, ema_len=settings.mtf_ema_len, fallback_len=50,
+            )
+            self._mtf_cache[symbol] = (now, trend)
+        return gate_entry(side, trend, settings)
 
     # ---- 진입 ----
     async def _open(
@@ -675,9 +736,17 @@ class TradingBot:
         news_triggered_at: datetime | None = None,
         *,
         news_ko: str = "",
+        size_mult: float = 1.0,
     ) -> None:
         # 실시간 설정 반영: 진입 시점의 명목금액을 사용(진입 후 스냅샷 고정).
-        notional = settings.position_size_usdt
+        atr = ind.atr if ind.atr and not np.isnan(ind.atr) else ind.last_price * 0.01
+        notional = compute_notional(
+            settings.position_size_usdt,
+            atr=atr,
+            price=ind.last_price,
+            sizing_state=self._sizing,
+            extra_mult=size_mult,
+        )
         leverage = max(1, int(leverage))
         triggered = news_triggered_at or _now()
         price = ind.last_price
@@ -705,7 +774,7 @@ class TradingBot:
         async with self._lock:
             pos = Position(
                 symbol=symbol, side=side, amount=filled, entry_price=order_price,
-                atr=ind.atr if ind.atr and not np.isnan(ind.atr) else order_price * 0.01,
+                atr=atr,
                 entry_news=news, entry_news_ko=news_ko, entry_score=score,
                 news_triggered_at=triggered,
                 notional=notional, leverage=leverage,
@@ -777,7 +846,14 @@ class TradingBot:
             add_lev = score_to_leverage(score)
         else:
             add_lev = min(pos.leverage + 1, 25)
-        await self._add(pos, ind, news, score, max(1, int(add_lev)), news_ko=news_ko)
+        ok, mtf_mult, mtf_reason = await self._mtf_gate(symbol, pos.side)
+        if not ok:
+            self._emit_log("INFO", "entry", f"추가진입 스킵 {symbol}: {mtf_reason}")
+            return
+        await self._add(
+            pos, ind, news, score, max(1, int(add_lev)),
+            news_ko=news_ko, size_mult=mtf_mult,
+        )
 
     async def _add(
         self,
@@ -788,8 +864,16 @@ class TradingBot:
         leverage: int,
         *,
         news_ko: str = "",
+        size_mult: float = 1.0,
     ) -> None:
-        notional = settings.position_size_usdt
+        atr = ind.atr if ind.atr and not np.isnan(ind.atr) else pos.atr
+        notional = compute_notional(
+            settings.position_size_usdt,
+            atr=atr,
+            price=ind.last_price,
+            sizing_state=self._sizing,
+            extra_mult=size_mult,
+        )
         leverage = max(1, int(leverage))
         price = ind.last_price
         add_margin = notional / leverage
@@ -814,7 +898,6 @@ class TradingBot:
 
         async with self._lock:
             prev_entry = pos.entry_price
-            atr = ind.atr if ind.atr and not np.isnan(ind.atr) else pos.atr
             pos.add_fill(
                 add_amount=filled, add_price=add_price, add_notional=notional,
                 add_margin=add_margin, leverage=leverage, atr=atr,
@@ -902,23 +985,74 @@ class TradingBot:
 
     # ---- 청산 ----
     async def _close(self, pos: Position, signal) -> None:
+        frac = getattr(signal, "close_fraction", None)
+        is_partial = (
+            signal.exit_type == "scale_out"
+            and frac is not None
+            and 0.05 <= float(frac) < 1.0
+            and not pos.scale_out_done
+        )
+        close_amount = pos.amount * float(frac) if is_partial else pos.amount
+        close_notional = pos.notional * float(frac) if is_partial else pos.notional
+        close_margin = (
+            (pos.margin if pos.margin > 0 else pos.notional / max(pos.leverage, 1))
+            * (float(frac) if is_partial else 1.0)
+        )
+
         exit_price = pos.mark_price
         pnl_pct = pos.unrealized_pct()
-        # 손익 금액(USDT) = 진입 명목금액 × 손익률. (레버리지는 증거금에만 영향)
-        pnl_usdt = pos.notional * (pnl_pct / 100)
+        pnl_usdt = close_notional * (pnl_pct / 100)
+
         if self.sim:
-            # 누적 증거금(피라미딩 포함) + 손익을 페이퍼 잔고로 환원.
-            margin = pos.margin if pos.margin > 0 else pos.notional / pos.leverage
-            self.sim_market.balance += margin + pnl_usdt
+            self.sim_market.balance += close_margin + pnl_usdt
             self.state.set_balance(self.sim_market.balance)
         else:
             result = await self.engine.close_position(
-                pos.symbol, pos.side, pos.amount, order_type=signal.order_type
+                pos.symbol, pos.side, close_amount,
+                order_type=signal.order_type,
+                register_exit=not is_partial,
             )
-            if result.is_filled and result.price:
+            if not result.is_filled:
+                self._emit_log(
+                    "ERROR", "order",
+                    f"청산 실패 {pos.symbol}: {result.reason}",
+                )
+                return
+            if result.price:
                 exit_price = result.price
+                pos.mark_price = exit_price
                 pnl_pct = pos.unrealized_pct()
-                pnl_usdt = pos.notional * (pnl_pct / 100)
+                pnl_usdt = close_notional * (pnl_pct / 100)
+
+        if is_partial:
+            async with self._lock:
+                pos.apply_scale_out(float(frac))
+            self._sizing.stats.record(pnl_pct)
+            self._sync_position_view(pos)
+            self._emit_log(
+                "INFO", "exit",
+                f"부분익절 {pos.side.upper()} {pos.symbol} | "
+                f"{float(frac) * 100:.0f}% @ {exit_price:.4f} "
+                f"PnL={pnl_pct:+.2f}% ({pnl_usdt:+.2f}USDT) | 잔량={pos.amount:.6f} | "
+                f"{signal.reason}",
+            )
+            self.state.record_trade({
+                "symbol": pos.symbol,
+                "side": pos.side,
+                "leverage": pos.leverage,
+                "notional": close_notional,
+                "entry_price": pos.entry_price,
+                "exit_price": exit_price,
+                "pnl_pct": pnl_pct,
+                "pnl_usdt": pnl_usdt,
+                "exit_type": "scale_out",
+                "partial": True,
+            })
+            if not self.sim and self.engine is not None:
+                bal, _ = await self.engine.fetch_balance_usdt()
+                self.state.set_balance(bal)
+                self._last_balance_fetch = asyncio.get_running_loop().time()
+            return
 
         async with self._lock:
             self.positions.pop(pos.symbol, None)
@@ -943,6 +1077,7 @@ class TradingBot:
             )
         )
         self.state.remove_position(pos.symbol)
+        self._sizing.stats.record(pnl_pct)
 
         if not self.sim and self.engine is not None:
             bal, _ = await self.engine.fetch_balance_usdt()
@@ -954,7 +1089,7 @@ class TradingBot:
             "symbol": pos.symbol,
             "side": pos.side,
             "leverage": pos.leverage,
-            "notional": pos.notional,
+            "notional": pos.notional if not is_partial else close_notional,
             "entry_price": pos.entry_price,
             "exit_price": exit_price,
             "pnl_pct": pnl_pct,

@@ -228,6 +228,22 @@ class TradingEngine:
         )
         return indicators
 
+    async def fetch_mtf_frames(
+        self,
+        symbol: str,
+        timeframes: list[str],
+        *,
+        ema_len: int = 200,
+    ) -> dict[str, pd.DataFrame]:
+        """MTF 필터용 OHLCV 프레임 맵 (워밍업 여유 포함)."""
+        out: dict[str, pd.DataFrame] = {}
+        limit = max(ema_len + 20, 80)
+        for tf in timeframes:
+            df = await self.fetch_ohlcv_df(symbol, limit=limit, timeframe=tf)
+            if df is not None and not df.empty:
+                out[tf] = df
+        return out
+
     # ---- 계정/시세 조회 ----
     async def fetch_balance_usdt(self) -> tuple[float, str | None]:
         """USDⓈ-M 선물 지갑의 USDT 가용 잔고를 조회한다.
@@ -364,11 +380,28 @@ class TradingEngine:
             # 한도 내 슬롯을 선점하기 위해 카운터에 임시 등록(체결 실패 시 롤백).
             self._open_positions[symbol] = side
 
-        result = await self._submit_marketable_limit(
-            symbol, side, leverage=leverage, notional=notional
-        )
+        retries = max(0, int(settings.entry_retry_count))
+        delay_s = max(0, int(settings.entry_retry_delay_ms)) / 1000.0
+        result = OrderResult(symbol, side, "unfilled", 0.0, 0.0, 0.0, reason="no attempt")
+        for attempt in range(retries + 1):
+            chase = float(settings.entry_chase_bps) * attempt
+            result = await self._submit_marketable_limit(
+                symbol, side, leverage=leverage, notional=notional, chase_bps=chase,
+            )
+            if result.is_filled:
+                break
+            if attempt < retries and delay_s > 0:
+                await asyncio.sleep(delay_s)
 
-        # 체결 실패 시 선점한 슬롯을 롤백한다.
+        if not result.is_filled and settings.entry_fallback_market:
+            log.warning(
+                "IOC entry failed → market fallback | %s %s | last=%s",
+                symbol, side, result.reason,
+            )
+            result = await self._market_entry(
+                symbol, side, leverage=leverage, notional=notional,
+            )
+
         if not result.is_filled:
             async with self._lock:
                 self._open_positions.pop(symbol, None)
@@ -399,14 +432,64 @@ class TradingEngine:
         주문만 추가로 제출한다. 레버리지를 주면 추가 분에 맞춰 재설정한다.
         """
         result = await self._submit_marketable_limit(
-            symbol, side, leverage=leverage, notional=notional
+            symbol, side, leverage=leverage, notional=notional,
         )
+        if not result.is_filled and settings.entry_fallback_market:
+            result = await self._market_entry(
+                symbol, side, leverage=leverage, notional=notional,
+            )
         if result.is_filled:
             log.info(
                 "Position increased | %s %s | add_filled=%.6f @ %.4f",
                 symbol, side, result.filled_amount, result.price,
             )
         return result
+
+    async def _market_entry(
+        self,
+        symbol: str,
+        side: Side,
+        *,
+        leverage: int | None = None,
+        notional: float | None = None,
+    ) -> OrderResult:
+        """시장가 진입 (IOC 실패 시 폴백용)."""
+        await self._prepare_symbol(symbol, leverage=leverage)
+        notional_usdt = float(notional) if notional else self.notional_usdt
+        quote = await self._best_quote(symbol)
+        if quote is None:
+            return OrderResult(symbol, side, "error", 0.0, 0.0, 0.0, reason="no order book")
+        best_bid, best_ask = quote
+        ref = best_ask if side == "long" else best_bid
+        if ref <= 0:
+            return OrderResult(symbol, side, "error", 0.0, 0.0, 0.0, reason="bad quote")
+        order_side = "buy" if side == "long" else "sell"
+        raw_amount = notional_usdt / ref
+        try:
+            amount = float(self.exchange.amount_to_precision(symbol, raw_amount))
+        except Exception:  # noqa: BLE001
+            amount = round(raw_amount, 6)
+        try:
+            order = await self.exchange.create_order(
+                symbol, "market", order_side, amount, None, {},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_exception(log, exc, context="market_entry", symbol=symbol, side=side)
+            return OrderResult(
+                symbol, side, "error", amount, 0.0, ref,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+        filled = float(order.get("filled") or 0.0)
+        fill_price = float(order.get("average") or order.get("price") or ref)
+        if filled > 0:
+            return OrderResult(
+                symbol, side, "filled", amount, filled, fill_price,
+                order.get("id"), "market fallback", order,
+            )
+        return OrderResult(
+            symbol, side, "unfilled", amount, 0.0, fill_price,
+            order.get("id"), "market unfilled", order,
+        )
 
     async def _submit_marketable_limit(
         self,
@@ -415,6 +498,7 @@ class TradingEngine:
         *,
         leverage: int | None = None,
         notional: float | None = None,
+        chase_bps: float = 0.0,
     ) -> OrderResult:
         """호가를 가로지르는 지정가(IOC/FOK) 주문을 제출하고 결과를 평가한다."""
         await self._prepare_symbol(symbol, leverage=leverage)
@@ -429,10 +513,10 @@ class TradingEngine:
         # 호가를 가로질러 즉시 체결을 노린다(= 가변형 시장 지정가).
         if side == "long":
             order_side = "buy"
-            limit_price = best_ask
+            limit_price = best_ask * (1 + chase_bps / 10_000.0) if chase_bps else best_ask
         else:
             order_side = "sell"
-            limit_price = best_bid
+            limit_price = best_bid * (1 - chase_bps / 10_000.0) if chase_bps else best_bid
 
         # 명목 가치(USDT)를 수량으로 환산하고 거래소 정밀도에 맞춰 반올림한다.
         raw_amount = notional_usdt / limit_price
@@ -445,8 +529,8 @@ class TradingEngine:
 
         params = {"timeInForce": self.tif}
         log.info(
-            "Submitting marketable-limit | %s %s | price=%s amount=%s tif=%s",
-            symbol, order_side, price, amount, self.tif,
+            "Submitting marketable-limit | %s %s | price=%s amount=%s tif=%s chase_bps=%s",
+            symbol, order_side, price, amount, self.tif, chase_bps,
         )
 
         try:
@@ -520,11 +604,14 @@ class TradingEngine:
         side: Side,
         amount: float,
         order_type: str = "market",
+        *,
+        register_exit: bool = True,
     ) -> OrderResult:
         """오픈 포지션을 청산한다.
 
         ``order_type='market'``  : 즉시 시장가 청산(고정 손절/트레일링 스톱용).
         ``order_type='marketable_limit'`` : 호가를 가로지르는 지정가 청산(시간 청산용).
+        ``register_exit=False`` : 부분 익절 시 포지션 카운터를 유지한다.
 
         Long 포지션은 매도(sell)로, Short 포지션은 매수(buy)로 반대 방향 주문을
         ``reduceOnly``로 제출한다.
@@ -562,11 +649,11 @@ class TradingEngine:
 
         filled = float(order.get("filled") or amount)
         fill_price = float(order.get("average") or order.get("price") or price or 0.0)
-        # 청산 성공 시 포지션 카운터에서 제거.
-        self.register_exit(symbol)
+        if register_exit:
+            self.register_exit(symbol)
         log.info(
-            "Position closed | %s %s | type=%s filled=%.6f price=%.4f | open_now=%d",
-            symbol, side, order_type, filled, fill_price, self.position_count,
+            "Position closed | %s %s | type=%s filled=%.6f price=%.4f | register_exit=%s | open_now=%d",
+            symbol, side, order_type, filled, fill_price, register_exit, self.position_count,
         )
         return OrderResult(
             symbol, side, "filled", amount, filled, fill_price,

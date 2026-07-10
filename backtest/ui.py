@@ -20,6 +20,7 @@ from backtest.engine import (
 )
 from config import Settings, settings
 from kst_util import TZ_LABEL, format_kst, series_ms_to_kst_pandas
+from mtf_filter import parse_mtf_tfs
 
 _TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d")
 _PLOTLY_DARK = dict(
@@ -288,21 +289,24 @@ def render_backtest_tab() -> None:
         f"{'90일 전체는 1~3분 소요될 수 있습니다' if span_days >= 60 else ''}"
     ):
         try:
+            mtf_tfs = parse_mtf_tfs(cfg.mtf_tfs) if cfg.mtf_filter_enabled else []
             if mode == "최근 N일":
                 until = int(datetime.combine(end_d, datetime.min.time(), tzinfo=timezone.utc).timestamp() * 1000)
                 since = int(datetime.combine(start_d, datetime.min.time(), tzinfo=timezone.utc).timestamp() * 1000)
-                df_1m, df_ind = fetch_backtest_frames(
+                df_1m, df_ind, mtf_frames = fetch_backtest_frames(
                     symbol, since_ms=since, until_ms=until,
                     indicator_tf=cfg.timeframe, testnet=use_testnet,
+                    mtf_tfs=mtf_tfs, mtf_ema_len=cfg.mtf_ema_len,
                 )
             else:
                 since = int(datetime.combine(start_d, datetime.min.time(), tzinfo=timezone.utc).timestamp() * 1000)
                 until = int(
                     (datetime.combine(end_d, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)).timestamp() * 1000
                 )
-                df_1m, df_ind = fetch_backtest_frames(
+                df_1m, df_ind, mtf_frames = fetch_backtest_frames(
                     symbol, since_ms=since, until_ms=until,
                     indicator_tf=cfg.timeframe, testnet=use_testnet,
+                    mtf_tfs=mtf_tfs, mtf_ema_len=cfg.mtf_ema_len,
                 )
         except Exception as exc:  # noqa: BLE001
             st.error(f"시세 조회 실패: {exc}")
@@ -345,6 +349,7 @@ def render_backtest_tab() -> None:
                 costs=costs,
                 trade_start_ms=trade_start,
                 trade_end_ms=trade_end,
+                mtf_frames=mtf_frames,
             )
         except Exception as exc:  # noqa: BLE001
             st.error(f"백테스트 오류: {exc}")
