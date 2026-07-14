@@ -224,6 +224,8 @@ class TradingBot:
         self._mtf_cache: dict[str, tuple[float, object]] = {}  # symbol -> (mono_ts, MtfTrend)
         self._deriv_cache: dict[str, tuple[float, object]] = {}  # symbol -> (mono_ts, DerivativesSnapshot)
         self._pending_entries: dict[str, PendingEntry] = {}
+        self._last_orphan_check: float = 0.0
+        self._orphan_poll_sec = 60.0
 
         # 모드별 구성.
         self.exchange = None
@@ -1079,6 +1081,64 @@ class TradingBot:
                 self.state.set_balance(bal)
                 if bal_err:
                     self._emit_log("ERROR", "system", f"잔고 조회 실패: {bal_err}")
+            if loop.time() - self._last_orphan_check >= self._orphan_poll_sec:
+                self._last_orphan_check = loop.time()
+                await self._reconcile_orphan_positions()
+
+    async def _reconcile_orphan_positions(self) -> None:
+        """봇이 추적하지 않는 거래소 잔여(dust) 포지션을 시장가로 정리한다."""
+        if self.sim or self.engine is None:
+            return
+        try:
+            open_pos = await self.engine.fetch_open_positions()
+        except Exception as exc:  # noqa: BLE001
+            log_exception(log, exc, context="orphan_reconcile_fetch")
+            return
+        tracked = set(self.positions.keys())
+
+        def _norm(s: str) -> str:
+            return (
+                str(s).upper()
+                .replace(":USDT", "")
+                .replace("/USDT", "")
+                .replace("USDT", "")
+                .replace("/", "")
+                .strip()
+            )
+
+        tracked_n = {_norm(s) for s in tracked}
+        for p in open_pos:
+            raw_sym = str(p.get("symbol") or "")
+            key = _norm(raw_sym)
+            if key in tracked_n:
+                continue
+            raw_side = (p.get("side") or "").lower()
+            contracts = abs(float(p.get("contracts") or 0))
+            if contracts <= 0 or raw_side not in ("long", "short"):
+                continue
+            # 봇 심볼 형식으로 매핑
+            bot_sym = next(
+                (s for s in self.symbols if _norm(s) == key),
+                raw_sym.split(":")[0] if ":" in raw_sym else raw_sym,
+            )
+            self._emit_log(
+                "WARNING", "system",
+                f"고아 포지션 감지 → 시장가 정리 {bot_sym} {raw_side} x{contracts:.8f}",
+            )
+            result = await self.engine.close_position(
+                bot_sym, raw_side, contracts,  # type: ignore[arg-type]
+                order_type="market", register_exit=True, verify_flat=True,
+            )
+            if result.is_filled:
+                self._emit_log(
+                    "WARNING", "exit",
+                    f"고아 포지션 청산 완료 {bot_sym} @ {result.price:.4f}",
+                )
+            else:
+                self._emit_log(
+                    "ERROR", "order",
+                    f"고아 포지션 청산 실패 {bot_sym}: {result.reason}",
+                )
 
     async def _monitor_pending_entry(self, symbol: str, ind) -> None:
         """하이브리드 Maker 2차 체결 대기·만료 처리."""
@@ -1169,10 +1229,20 @@ class TradingBot:
             self.sim_market.balance += close_margin + pnl_usdt
             self.state.set_balance(self.sim_market.balance)
         else:
+            # 전량 청산: 거래소 실제 잔량이 봇 추적보다 크면 거래소 수량으로 맞춤
+            if not is_partial:
+                ex_side, ex_amt = await self.engine.get_position_contracts(pos.symbol)
+                if ex_side == pos.side and ex_amt > close_amount:
+                    self._emit_log(
+                        "WARNING", "order",
+                        f"청산 수량 보정 {pos.symbol}: bot={close_amount:.8f} → exchange={ex_amt:.8f}",
+                    )
+                    close_amount = ex_amt
             result = await self.engine.close_position(
                 pos.symbol, pos.side, close_amount,
                 order_type=signal.order_type,
                 register_exit=not is_partial,
+                verify_flat=not is_partial,
             )
             if not result.is_filled:
                 self._emit_log(
@@ -1185,6 +1255,27 @@ class TradingBot:
                 pos.mark_price = exit_price
                 pnl_pct = pos.unrealized_pct()
                 pnl_usdt = close_notional * (pnl_pct / 100)
+            # 전량 청산인데 거래소에 아직 잔량이 있으면 재시도
+            if not is_partial:
+                rem_side, rem_amt = await self.engine.get_position_contracts(pos.symbol)
+                if rem_side == pos.side and rem_amt > 0:
+                    self._emit_log(
+                        "WARNING", "order",
+                        f"청산 후 잔량 재정리 {pos.symbol}: {rem_amt:.8f}",
+                    )
+                    dust = await self.engine.flatten_symbol(pos.symbol)
+                    if dust is not None and dust.is_filled and dust.price:
+                        exit_price = dust.price
+                        pos.mark_price = exit_price
+                        pnl_pct = pos.unrealized_pct()
+                        pnl_usdt = close_notional * (pnl_pct / 100)
+                    rem_side2, rem_amt2 = await self.engine.get_position_contracts(pos.symbol)
+                    if rem_side2 == pos.side and rem_amt2 > 0:
+                        self._emit_log(
+                            "ERROR", "order",
+                            f"청산 후에도 거래소 잔량 유지 {pos.symbol}: {rem_amt2:.8f} "
+                            f"— 봇 상태는 유지하지 않음(수동 확인 필요)",
+                        )
 
         if is_partial:
             async with self._lock:
