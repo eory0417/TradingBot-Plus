@@ -32,7 +32,13 @@ from bb_breakout import BB_OHLCV_LIMIT, evaluate_bb_entry
 from config import settings
 from logger import format_exception_brief, get_logger, log_exception
 from derivatives_filter import gate_entry as deriv_gate_entry
-from mtf_filter import evaluate_mtf_from_frames, gate_entry, parse_mtf_tfs
+from mtf_filter import (
+    MtfTrend,
+    evaluate_mtf_from_frames,
+    gate_entry,
+    mtf_with_trend,
+    parse_mtf_tfs,
+)
 from news_analyzer import AnalyzedNews, NewsAnalyzer
 from news_category import category_exit_overrides, classify_news
 from news_weights import effective_news_score
@@ -744,34 +750,44 @@ class TradingBot:
         add_lev = min(pos.leverage + 1, settings.bb_max_add_leverage)
         await self._add(pos, ind, label, 0.0, max(1, int(add_lev)), size_mult=size_mult)
 
+    async def _fetch_mtf_trend(self, symbol: str):
+        """캐시(60s)된 MTF bias. 진입 필터 OFF여도 청산 완화용으로 조회 가능."""
+        now = asyncio.get_running_loop().time()
+        cached = self._mtf_cache.get(symbol)
+        if cached and now - cached[0] < 60.0:
+            return cached[1]
+        tfs = parse_mtf_tfs(settings.mtf_tfs)
+        if self.sim and self.sim_market is not None:
+            rows = self.sim_market.ohlcv(symbol, limit=max(settings.mtf_ema_len + 20, 80))
+            df = pd.DataFrame(
+                rows, columns=["timestamp", "open", "high", "low", "close", "volume"],
+            )
+            frames = {tf: df for tf in tfs}
+        elif self.engine is not None:
+            frames = await self.engine.fetch_mtf_frames(
+                symbol, tfs, ema_len=settings.mtf_ema_len,
+            )
+        else:
+            return MtfTrend(bias="neutral", ready=False, details="mtf no engine")
+        trend = evaluate_mtf_from_frames(
+            frames, ema_len=settings.mtf_ema_len, fallback_len=50,
+        )
+        self._mtf_cache[symbol] = (now, trend)
+        return trend
+
     async def _mtf_gate(self, symbol: str, side: Side) -> tuple[bool, float, str]:
         """MTF EMA 필터. (허용, 사이즈배수, 사유)."""
         if not settings.mtf_filter_enabled:
             return True, 1.0, "mtf off"
-        now = asyncio.get_running_loop().time()
-        cached = self._mtf_cache.get(symbol)
-        if cached and now - cached[0] < 60.0:
-            trend = cached[1]
-        else:
-            tfs = parse_mtf_tfs(settings.mtf_tfs)
-            if self.sim and self.sim_market is not None:
-                # SIM: 1m 합성 종가를 상위 TF로 간주해 동일 시리즈 사용
-                rows = self.sim_market.ohlcv(symbol, limit=max(settings.mtf_ema_len + 20, 80))
-                df = pd.DataFrame(
-                    rows, columns=["timestamp", "open", "high", "low", "close", "volume"],
-                )
-                frames = {tf: df for tf in tfs}
-            elif self.engine is not None:
-                frames = await self.engine.fetch_mtf_frames(
-                    symbol, tfs, ema_len=settings.mtf_ema_len,
-                )
-            else:
-                return True, 1.0, "mtf no engine"
-            trend = evaluate_mtf_from_frames(
-                frames, ema_len=settings.mtf_ema_len, fallback_len=50,
-            )
-            self._mtf_cache[symbol] = (now, trend)
+        trend = await self._fetch_mtf_trend(symbol)
         return gate_entry(side, trend, settings)
+
+    async def _mtf_exit_relax(self, symbol: str, side: Side) -> bool:
+        """롱+bull / 숏+bear 동조 시 trail·시간청산 완화."""
+        if not settings.mtf_exit_relax_enabled:
+            return False
+        trend = await self._fetch_mtf_trend(symbol)
+        return mtf_with_trend(trend.bias, side)
 
     async def _deriv_gate(self, symbol: str, side: Side) -> tuple[bool, float, str]:
         """펀딩·OI 필터. (허용, 사이즈배수, 사유)."""
@@ -1103,9 +1119,14 @@ class TradingBot:
                 continue
 
             news_title, news_score = self._latest_news[symbol]
+            exit_relax = await self._mtf_exit_relax(symbol, pos.side)
             signal = pos.update(
                 ind.last_price, atr=ind.atr, slope=ind.slope, rsi=ind.rsi,
                 news_score=news_score,
+                exit_relax=exit_relax,
+                exit_trail_atr_mult=settings.mtf_exit_trail_atr_mult,
+                exit_trail_profit_pct=settings.mtf_exit_trail_profit_pct,
+                exit_time_hours=settings.mtf_exit_time_hours,
             )
             self._sync_position_view(pos)
 

@@ -471,6 +471,27 @@ def render_sidebar() -> None:
             "MTF 축소배수", min_value=0.05, max_value=1.0,
             value=float(settings.mtf_reduce_mult), step=0.05,
         ))
+        settings.mtf_exit_relax_enabled = st.checkbox(
+            "MTF 동조 청산 완화",
+            value=bool(settings.mtf_exit_relax_enabled),
+            help="1h/4h bull이면 롱(bear면 숏) trail·시간청산 완화",
+        )
+        if settings.mtf_exit_relax_enabled:
+            settings.mtf_exit_trail_atr_mult = float(st.number_input(
+                "완화 trail ATR×", min_value=1.5, max_value=6.0,
+                value=float(settings.mtf_exit_trail_atr_mult), step=0.25,
+                help="기본 trail보다 넓게 (추천 3.0)",
+            ))
+            settings.mtf_exit_trail_profit_pct = float(st.number_input(
+                "완화 trail 활성화 %", min_value=0.5, max_value=10.0,
+                value=float(settings.mtf_exit_trail_profit_pct), step=0.25,
+                help="이 이상 수익일 때 trail 시작 (추천 2.0)",
+            ))
+            settings.mtf_exit_time_hours = float(st.number_input(
+                "완화 시간청산(h)", min_value=1.0, max_value=48.0,
+                value=float(settings.mtf_exit_time_hours), step=1.0,
+                help="동조 시 더 오래 보유 (추천 7h)",
+            ))
         size_modes = ("fixed", "vol", "vol_kelly")
         settings.sizing_mode = st.selectbox(
             "사이징",

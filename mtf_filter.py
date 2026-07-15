@@ -122,6 +122,11 @@ def mtf_allows_side(bias: Bias, side: Side, *, mode: str) -> bool:
     return True
 
 
+def mtf_with_trend(bias: Bias, side: Side) -> bool:
+    """포지션 방향과 MTF bias가 동조하는지 (롱+bull / 숏+bear)."""
+    return (side == "long" and bias == "bull") or (side == "short" and bias == "bear")
+
+
 def mtf_size_mult(bias: Bias, side: Side, *, mode: str, reduce_mult: float) -> float:
     """reduce 모드에서 역추세 시 사이즈 배수. 그 외 1.0."""
     if mode != "reduce":

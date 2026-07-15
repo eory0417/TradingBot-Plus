@@ -263,21 +263,42 @@ class Position:
         rsi: Optional[float] = None,
         news_score: Optional[float] = None,
         now: Optional[datetime] = None,
+        exit_relax: bool = False,
+        exit_trail_atr_mult: Optional[float] = None,
+        exit_trail_profit_pct: Optional[float] = None,
+        exit_time_hours: Optional[float] = None,
     ) -> ExitSignal:
         """현재가/지표/뉴스로 트레일링 라인을 갱신하고 청산 여부를 판정한다.
 
         ``atr``/``slope``/``rsi``/``news_score``는 최신 지표가 있을 때만 전달하면
         되며(예: 15분봉 갱신 시), 없으면 직전 값을 유지한다.
+
+        ``exit_relax``가 True이면(MTF 동조) trail 활성화·ATR 폭·시간청산을
+        완화 파라미터로 덮어쓴다. 뉴스 tighten 중이면 ATR 완화는 적용하지 않는다.
         """
         now = now or _now()
         self.mark_price = mark_price
         if atr is not None and atr > 0:
             self.atr = atr
 
+        act_pct = self.trailing_profit_pct
+        time_h = self.time_exit_hours
+        if exit_relax:
+            if exit_trail_profit_pct is not None:
+                act_pct = float(exit_trail_profit_pct)
+            if exit_time_hours is not None:
+                time_h = float(exit_time_hours)
+
         # ---- 1) 트레일링 활성화: 이익 구간 도달 시에만 ----
         try:
             if not self.trailing_active:
-                if self._profit_pct(mark_price) >= self.trailing_profit_pct:
+                if self._profit_pct(mark_price) >= act_pct:
+                    if (
+                        exit_relax
+                        and exit_trail_atr_mult is not None
+                        and not self.tightened
+                    ):
+                        self.atr_mult = max(self.atr_mult, float(exit_trail_atr_mult))
                     self._activate_trailing(mark_price)
 
             prev_rsi = self.prev_rsi
@@ -294,19 +315,34 @@ class Position:
                     self.tightened = True
                     self.atr_mult = self.atr_mult_tight
 
+                use_relax_trail = (
+                    exit_relax
+                    and exit_trail_atr_mult is not None
+                    and not self.tightened
+                )
+                if use_relax_trail:
+                    self.atr_mult = max(self.atr_mult, float(exit_trail_atr_mult))
+
                 distance = self.atr * self.atr_mult
                 if self.side == "long":
                     self.highest_price = max(self.highest_price, mark_price)
                     candidate = self.highest_price - distance
-                    self.trailing_stop = max(
-                        self.trailing_stop, candidate, self.entry_price
-                    )
+                    if use_relax_trail:
+                        # 넓은 ATR 기준으로 peak에서 재계산 — 동조 시 스톱 이완 허용
+                        self.trailing_stop = max(self.entry_price, candidate)
+                    else:
+                        self.trailing_stop = max(
+                            self.trailing_stop, candidate, self.entry_price
+                        )
                 else:
                     self.lowest_price = min(self.lowest_price, mark_price)
                     candidate = self.lowest_price + distance
-                    self.trailing_stop = min(
-                        self.trailing_stop, candidate, self.entry_price
-                    )
+                    if use_relax_trail:
+                        self.trailing_stop = min(self.entry_price, candidate)
+                    else:
+                        self.trailing_stop = min(
+                            self.trailing_stop, candidate, self.entry_price
+                        )
 
             # ---- 2.5) Scale-out: ATR 목표가 도달 시 1회 부분 익절 ----
             if (
@@ -377,12 +413,13 @@ class Position:
 
             # ---- 5) 시간 청산(횡보 시, 시장 지정가) ----
             held = now - self.opened_at
-            if not self.tightened and held >= timedelta(hours=self.time_exit_hours):
+            if not self.tightened and held >= timedelta(hours=time_h):
                 hours = held.total_seconds() / 3600
+                relax_tag = " [MTF relax]" if exit_relax and time_h != self.time_exit_hours else ""
                 return ExitSignal(
                     True,
-                    reason=f"time exit: held {hours:.1f}h >= {self.time_exit_hours}h "
-                    f"without a clear trend (sideways)",
+                    reason=f"time exit: held {hours:.1f}h >= {time_h}h "
+                    f"without a clear trend (sideways){relax_tag}",
                     exit_type="time_exit",
                     order_type="marketable_limit",
                 )

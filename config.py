@@ -161,6 +161,11 @@ class Settings(BaseSettings):
     mtf_mode: str = Field(default="reduce", alias="MTF_MODE")  # block | reduce
     mtf_reduce_mult: float = Field(default=0.3, alias="MTF_REDUCE_MULT")
     mtf_require_ready: bool = Field(default=False, alias="MTF_REQUIRE_READY")
+    # MTF 동조(롱+bull / 숏+bear) 시 trail·시간청산 완화
+    mtf_exit_relax_enabled: bool = Field(default=True, alias="MTF_EXIT_RELAX_ENABLED")
+    mtf_exit_trail_atr_mult: float = Field(default=3.0, alias="MTF_EXIT_TRAIL_ATR_MULT")
+    mtf_exit_trail_profit_pct: float = Field(default=2.0, alias="MTF_EXIT_TRAIL_PROFIT_PCT")
+    mtf_exit_time_hours: float = Field(default=7.0, alias="MTF_EXIT_TIME_HOURS")
 
     # ---- Scale-out (부분 익절) ----
     scale_out_enabled: bool = Field(default=True, alias="SCALE_OUT_ENABLED")
