@@ -41,6 +41,7 @@ from sizing import SizingState, compute_notional
 from state import STATE, NewsView, PositionView, ClosedChartView
 from strategy import ExitSignal, Position, Side
 from trade_log import record_trade
+from symbol_util import normalize_symbol_key
 from kst_util import format_kst
 from trading_engine import TradingEngine, compute_indicators_from_df, RSI_LENGTH, ATR_LENGTH
 from translator import translate_to_korean
@@ -224,6 +225,7 @@ class TradingBot:
         self._mtf_cache: dict[str, tuple[float, object]] = {}  # symbol -> (mono_ts, MtfTrend)
         self._deriv_cache: dict[str, tuple[float, object]] = {}  # symbol -> (mono_ts, DerivativesSnapshot)
         self._pending_entries: dict[str, PendingEntry] = {}
+        self._entry_inflight: set[str] = set()  # 주문 중 고아정리 레이스 방지
         self._last_orphan_check: float = 0.0
         self._orphan_poll_sec = 60.0
 
@@ -528,15 +530,8 @@ class TradingBot:
         *,
         news_ko: str = "",
     ) -> None:
-        async with self._lock:
-            if symbol in self.positions:
-                return
-            if len(self.positions) >= settings.max_positions:
-                self._emit_log(
-                    "WARNING", "entry",
-                    f"진입 보류 {symbol}: 동시 포지션 한도({settings.max_positions}) 도달",
-                )
-                return
+        if not await self._can_open_slot(symbol):
+            return
 
         ind = await self._indicators(symbol)
         if ind is None:
@@ -571,25 +566,73 @@ class TradingBot:
                 return
             leverage = settings.leverage
 
-        ok, mtf_mult, mtf_reason = await self._mtf_gate(symbol, side)
+        ok, size_mult, reason = await self._entry_size_mult(symbol, side, label="진입")
         if not ok:
-            self._emit_log("INFO", "entry", f"진입 스킵 {symbol}: {mtf_reason}")
-            return
-        ok, deriv_mult, deriv_reason = await self._deriv_gate(symbol, side)
-        if not ok:
-            self._emit_log("INFO", "entry", f"진입 스킵 {symbol}: {deriv_reason}")
             return
 
         category = classify_news(news, news_ko)
         await self._open(
             symbol, side, ind, news, score, leverage, news_triggered_at,
-            news_ko=news_ko, size_mult=mtf_mult * deriv_mult,
+            news_ko=news_ko, size_mult=size_mult,
             use_hybrid=True, entry_category=category,
         )
 
     @staticmethod
     def _bb_label(side: Side) -> str:
         return f"BB BREAKOUT {side.upper()}"
+
+    async def _can_open_slot(self, symbol: str) -> bool:
+        """동시 포지션 한도·중복 심볼 검사."""
+        async with self._lock:
+            if symbol in self.positions:
+                return False
+            if len(self.positions) >= settings.max_positions:
+                self._emit_log(
+                    "WARNING", "entry",
+                    f"진입 보류 {symbol}: 동시 포지션 한도({settings.max_positions}) 도달",
+                )
+                return False
+        return True
+
+    @staticmethod
+    def _price_favorable(side: Side, last_price: float, entry_price: float) -> bool:
+        if side == "long":
+            return last_price > entry_price
+        return last_price < entry_price
+
+    async def _entry_size_mult(
+        self, symbol: str, side: Side, *, label: str,
+    ) -> tuple[bool, float, str]:
+        """MTF × 펀딩 게이트. 실패 시 로그 후 (False, 0, reason)."""
+        ok, mtf_mult, mtf_reason = await self._mtf_gate(symbol, side)
+        if not ok:
+            self._emit_log("INFO", "entry", f"{label} 스킵 {symbol}: {mtf_reason}")
+            return False, 0.0, mtf_reason
+        ok, deriv_mult, deriv_reason = await self._deriv_gate(symbol, side)
+        if not ok:
+            self._emit_log("INFO", "entry", f"{label} 스킵 {symbol}: {deriv_reason}")
+            return False, 0.0, deriv_reason
+        return True, mtf_mult * deriv_mult, "ok"
+
+    def _persist_trade(self, trade: dict) -> None:
+        """GUI 통계 + JSONL 영속 로그를 한 번에 기록."""
+        self.state.record_trade(trade)
+        record_trade(trade)
+
+    async def _refresh_live_balance(self) -> None:
+        if self.sim or self.engine is None:
+            return
+        bal, _ = await self.engine.fetch_balance_usdt()
+        self.state.set_balance(bal)
+        self._last_balance_fetch = asyncio.get_running_loop().time()
+
+    def _apply_exit_price(
+        self, pos: Position, exit_price: float, close_notional: float,
+    ) -> tuple[float, float, float]:
+        """청산가 반영 후 (exit_price, pnl_pct, pnl_usdt)."""
+        pos.mark_price = exit_price
+        pnl_pct = pos.unrealized_pct()
+        return exit_price, pnl_pct, close_notional * (pnl_pct / 100)
 
     def _log_bb_entry_fail(self, symbol: str, result) -> None:
         """BB 돌파가 감지된 뒤 진입 조건 미충족 시에만 로그를 남긴다."""
@@ -669,29 +712,17 @@ class TradingBot:
             await self._maybe_add_bb(symbol, pos, result.side, ind)
 
     async def _maybe_enter_bb(self, symbol: str, side: Side, ind) -> None:
-        async with self._lock:
-            if symbol in self.positions:
-                return
-            if len(self.positions) >= settings.max_positions:
-                self._emit_log(
-                    "WARNING", "entry",
-                    f"진입 보류 {symbol}: 동시 포지션 한도({settings.max_positions}) 도달",
-                )
-                return
-
-        ok, mtf_mult, mtf_reason = await self._mtf_gate(symbol, side)
-        if not ok:
-            self._emit_log("INFO", "entry", f"BB 진입 스킵 {symbol}: {mtf_reason}")
+        if not await self._can_open_slot(symbol):
             return
-        ok, deriv_mult, deriv_reason = await self._deriv_gate(symbol, side)
+
+        ok, size_mult, _ = await self._entry_size_mult(symbol, side, label="BB 진입")
         if not ok:
-            self._emit_log("INFO", "entry", f"BB 진입 스킵 {symbol}: {deriv_reason}")
             return
         label = self._bb_label(side)
         leverage = max(1, int(settings.bb_leverage))
         await self._open(
             symbol, side, ind, label, 0.0, leverage, _now(), news_ko="",
-            size_mult=mtf_mult * deriv_mult, entry_category="bb_breakout",
+            size_mult=size_mult, entry_category="bb_breakout",
         )
 
     async def _maybe_add_bb(
@@ -699,28 +730,19 @@ class TradingBot:
     ) -> None:
         if pos.added or side != pos.side:
             return
-        favorable = (
-            (pos.side == "long" and ind.last_price > pos.entry_price)
-            or (pos.side == "short" and ind.last_price < pos.entry_price)
-        )
         label = self._bb_label(side)
-        if not favorable:
+        if not self._price_favorable(pos.side, ind.last_price, pos.entry_price):
             self._emit_log(
                 "INFO", "entry",
                 f"추가진입 보류 {symbol}: 가격 미유리(현재 {ind.last_price:.4f} / "
                 f"평균 {pos.entry_price:.4f}) | {label}",
             )
             return
-        ok, mtf_mult, mtf_reason = await self._mtf_gate(symbol, side)
+        ok, size_mult, _ = await self._entry_size_mult(symbol, side, label="BB 추가진입")
         if not ok:
-            self._emit_log("INFO", "entry", f"BB 추가진입 스킵 {symbol}: {mtf_reason}")
-            return
-        ok, deriv_mult, deriv_reason = await self._deriv_gate(symbol, side)
-        if not ok:
-            self._emit_log("INFO", "entry", f"BB 추가진입 스킵 {symbol}: {deriv_reason}")
             return
         add_lev = min(pos.leverage + 1, settings.bb_max_add_leverage)
-        await self._add(pos, ind, label, 0.0, max(1, int(add_lev)), size_mult=mtf_mult * deriv_mult)
+        await self._add(pos, ind, label, 0.0, max(1, int(add_lev)), size_mult=size_mult)
 
     async def _mtf_gate(self, symbol: str, side: Side) -> tuple[bool, float, str]:
         """MTF EMA 필터. (허용, 사이즈배수, 사유)."""
@@ -829,9 +851,13 @@ class TradingBot:
             self.state.set_balance(self.sim_market.balance)
             order_price = price
         else:
-            result = await self.engine.enter_position(
-                symbol, side, leverage=leverage, notional=ioc_notional,
-            )
+            self._entry_inflight.add(symbol)
+            try:
+                result = await self.engine.enter_position(
+                    symbol, side, leverage=leverage, notional=ioc_notional,
+                )
+            finally:
+                self._entry_inflight.discard(symbol)
             if not result.is_filled:
                 ctx = self._news_context(news, score, news_ko)
                 self._emit_log(
@@ -842,6 +868,31 @@ class TradingBot:
             order_price = result.price
             filled = result.filled_amount
             ioc_filled_notional = filled * order_price if order_price else ioc_notional
+            # 거래소에 실제 포지션이 생겼는지 확인 (고아정리 레이스·허위체결 방지)
+            ex_side, ex_amt = await self.engine.get_position_contracts(symbol)
+            if ex_side is None or ex_amt <= 0:
+                self._emit_log(
+                    "ERROR", "order",
+                    f"진입 응답은 체결이나 거래소 포지션 없음 {symbol} {side} "
+                    f"(filled={filled:.6f} @ {order_price:.4f}) — 내부 등록 취소",
+                )
+                self.engine.register_exit(symbol)
+                return
+            if ex_side != side:
+                self._emit_log(
+                    "ERROR", "order",
+                    f"진입 방향 불일치 {symbol}: 주문={side} 거래소={ex_side} — 내부 등록 취소",
+                )
+                self.engine.register_exit(symbol)
+                return
+            # 실제 체결 수량으로 보정
+            if ex_amt > 0 and abs(ex_amt - filled) / max(ex_amt, filled, 1e-12) > 0.05:
+                self._emit_log(
+                    "WARNING", "order",
+                    f"진입 수량 보정 {symbol}: bot={filled:.8f} → exchange={ex_amt:.8f}",
+                )
+                filled = ex_amt
+                ioc_filled_notional = filled * order_price if order_price else ioc_notional
 
         async with self._lock:
             pos = Position(
@@ -887,9 +938,7 @@ class TradingBot:
         self._sync_position_view(self.positions[symbol])
 
         if not self.sim and self.engine is not None:
-            bal, _ = await self.engine.fetch_balance_usdt()
-            self.state.set_balance(bal)
-            self._last_balance_fetch = asyncio.get_running_loop().time()
+            await self._refresh_live_balance()
 
         if self.notifier is not None:
             await self.notifier.send_position_open(
@@ -921,11 +970,7 @@ class TradingBot:
         ind = await self._indicators(symbol)
         if ind is None:
             return
-        favorable = (
-            (pos.side == "long" and ind.last_price > pos.entry_price)
-            or (pos.side == "short" and ind.last_price < pos.entry_price)
-        )
-        if not favorable:
+        if not self._price_favorable(pos.side, ind.last_price, pos.entry_price):
             ctx = self._news_context(news, score, news_ko)
             self._emit_log(
                 "INFO", "entry",
@@ -939,17 +984,12 @@ class TradingBot:
             add_lev = score_to_leverage(score)
         else:
             add_lev = min(pos.leverage + 1, 25)
-        ok, mtf_mult, mtf_reason = await self._mtf_gate(symbol, pos.side)
+        ok, size_mult, _ = await self._entry_size_mult(symbol, pos.side, label="추가진입")
         if not ok:
-            self._emit_log("INFO", "entry", f"추가진입 스킵 {symbol}: {mtf_reason}")
-            return
-        ok, deriv_mult, deriv_reason = await self._deriv_gate(symbol, pos.side)
-        if not ok:
-            self._emit_log("INFO", "entry", f"추가진입 스킵 {symbol}: {deriv_reason}")
             return
         await self._add(
             pos, ind, news, score, max(1, int(add_lev)),
-            news_ko=news_ko, size_mult=mtf_mult * deriv_mult,
+            news_ko=news_ko, size_mult=size_mult,
         )
 
     async def _add(
@@ -1086,7 +1126,11 @@ class TradingBot:
                 await self._reconcile_orphan_positions()
 
     async def _reconcile_orphan_positions(self) -> None:
-        """봇이 추적하지 않는 거래소 잔여(dust) 포지션을 시장가로 정리한다."""
+        """봇이 추적하지 않는 거래소 잔여(dust) 포지션을 시장가로 정리한다.
+
+        진입 직후(``_entry_inflight`` / 엔진 슬롯 / pending Maker)는 절대 건드리지
+        않는다 — 이전 버전은 이 레이스로 방금 체결된 포지션을 바로 청산했다.
+        """
         if self.sim or self.engine is None:
             return
         try:
@@ -1094,31 +1138,22 @@ class TradingBot:
         except Exception as exc:  # noqa: BLE001
             log_exception(log, exc, context="orphan_reconcile_fetch")
             return
-        tracked = set(self.positions.keys())
 
-        def _norm(s: str) -> str:
-            return (
-                str(s).upper()
-                .replace(":USDT", "")
-                .replace("/USDT", "")
-                .replace("USDT", "")
-                .replace("/", "")
-                .strip()
-            )
-
-        tracked_n = {_norm(s) for s in tracked}
+        tracked_n = {normalize_symbol_key(s) for s in self.positions}
+        tracked_n |= {normalize_symbol_key(s) for s in self._entry_inflight}
+        tracked_n |= {normalize_symbol_key(s) for s in self._pending_entries}
+        tracked_n |= {normalize_symbol_key(s) for s in self.engine.tracked_symbols()}
         for p in open_pos:
             raw_sym = str(p.get("symbol") or "")
-            key = _norm(raw_sym)
+            key = normalize_symbol_key(raw_sym)
             if key in tracked_n:
                 continue
             raw_side = (p.get("side") or "").lower()
             contracts = abs(float(p.get("contracts") or 0))
             if contracts <= 0 or raw_side not in ("long", "short"):
                 continue
-            # 봇 심볼 형식으로 매핑
             bot_sym = next(
-                (s for s in self.symbols if _norm(s) == key),
+                (s for s in self.symbols if normalize_symbol_key(s) == key),
                 raw_sym.split(":")[0] if ":" in raw_sym else raw_sym,
             )
             self._emit_log(
@@ -1229,15 +1264,6 @@ class TradingBot:
             self.sim_market.balance += close_margin + pnl_usdt
             self.state.set_balance(self.sim_market.balance)
         else:
-            # 전량 청산: 거래소 실제 잔량이 봇 추적보다 크면 거래소 수량으로 맞춤
-            if not is_partial:
-                ex_side, ex_amt = await self.engine.get_position_contracts(pos.symbol)
-                if ex_side == pos.side and ex_amt > close_amount:
-                    self._emit_log(
-                        "WARNING", "order",
-                        f"청산 수량 보정 {pos.symbol}: bot={close_amount:.8f} → exchange={ex_amt:.8f}",
-                    )
-                    close_amount = ex_amt
             result = await self.engine.close_position(
                 pos.symbol, pos.side, close_amount,
                 order_type=signal.order_type,
@@ -1251,31 +1277,9 @@ class TradingBot:
                 )
                 return
             if result.price:
-                exit_price = result.price
-                pos.mark_price = exit_price
-                pnl_pct = pos.unrealized_pct()
-                pnl_usdt = close_notional * (pnl_pct / 100)
-            # 전량 청산인데 거래소에 아직 잔량이 있으면 재시도
-            if not is_partial:
-                rem_side, rem_amt = await self.engine.get_position_contracts(pos.symbol)
-                if rem_side == pos.side and rem_amt > 0:
-                    self._emit_log(
-                        "WARNING", "order",
-                        f"청산 후 잔량 재정리 {pos.symbol}: {rem_amt:.8f}",
-                    )
-                    dust = await self.engine.flatten_symbol(pos.symbol)
-                    if dust is not None and dust.is_filled and dust.price:
-                        exit_price = dust.price
-                        pos.mark_price = exit_price
-                        pnl_pct = pos.unrealized_pct()
-                        pnl_usdt = close_notional * (pnl_pct / 100)
-                    rem_side2, rem_amt2 = await self.engine.get_position_contracts(pos.symbol)
-                    if rem_side2 == pos.side and rem_amt2 > 0:
-                        self._emit_log(
-                            "ERROR", "order",
-                            f"청산 후에도 거래소 잔량 유지 {pos.symbol}: {rem_amt2:.8f} "
-                            f"— 봇 상태는 유지하지 않음(수동 확인 필요)",
-                        )
+                exit_price, pnl_pct, pnl_usdt = self._apply_exit_price(
+                    pos, result.price, close_notional,
+                )
 
         if is_partial:
             async with self._lock:
@@ -1289,7 +1293,7 @@ class TradingBot:
                 f"PnL={pnl_pct:+.2f}% ({pnl_usdt:+.2f}USDT) | 잔량={pos.amount:.6f} | "
                 f"{signal.reason}",
             )
-            self.state.record_trade({
+            self._persist_trade({
                 "symbol": pos.symbol,
                 "side": pos.side,
                 "leverage": pos.leverage,
@@ -1302,23 +1306,7 @@ class TradingBot:
                 "partial": True,
                 "entry_category": pos.entry_category,
             })
-            record_trade({
-                "symbol": pos.symbol,
-                "side": pos.side,
-                "leverage": pos.leverage,
-                "notional": close_notional,
-                "entry_price": pos.entry_price,
-                "exit_price": exit_price,
-                "pnl_pct": pnl_pct,
-                "pnl_usdt": pnl_usdt,
-                "exit_type": "scale_out",
-                "partial": True,
-                "entry_category": pos.entry_category,
-            })
-            if not self.sim and self.engine is not None:
-                bal, _ = await self.engine.fetch_balance_usdt()
-                self.state.set_balance(bal)
-                self._last_balance_fetch = asyncio.get_running_loop().time()
+            await self._refresh_live_balance()
             return
 
         pending = self._pending_entries.pop(pos.symbol, None)
@@ -1349,18 +1337,13 @@ class TradingBot:
         )
         self.state.remove_position(pos.symbol)
         self._sizing.stats.record(pnl_pct)
+        await self._refresh_live_balance()
 
-        if not self.sim and self.engine is not None:
-            bal, _ = await self.engine.fetch_balance_usdt()
-            self.state.set_balance(bal)
-            self._last_balance_fetch = asyncio.get_running_loop().time()
-
-        # 수익률 통계용 거래 기록.
-        trade_row = {
+        self._persist_trade({
             "symbol": pos.symbol,
             "side": pos.side,
             "leverage": pos.leverage,
-            "notional": pos.notional if not is_partial else close_notional,
+            "notional": pos.notional,
             "entry_price": pos.entry_price,
             "exit_price": exit_price,
             "pnl_pct": pnl_pct,
@@ -1372,9 +1355,7 @@ class TradingBot:
             "added": pos.added,
             "entry_category": pos.entry_category,
             "entry_news": pos.entry_news,
-        }
-        self.state.record_trade(trade_row)
-        record_trade(trade_row)
+        })
 
         ctx = self._news_context(pos.entry_news, pos.entry_score, pos.entry_news_ko)
         self._emit_log(

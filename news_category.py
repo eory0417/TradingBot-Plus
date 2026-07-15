@@ -8,17 +8,6 @@ from typing import Any
 
 from config import Settings, settings as default_settings
 
-CATEGORIES = (
-    "listing",
-    "hack",
-    "mainnet",
-    "partnership",
-    "etf",
-    "regulation",
-    "bb_breakout",
-    "default",
-)
-
 # 우선순위 높은 순 (먼저 매칭)
 _CATEGORY_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("listing", (

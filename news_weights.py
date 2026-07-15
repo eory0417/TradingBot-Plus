@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from config import Settings, settings as default_settings
+from symbol_util import normalize_symbol_key
 
 
 def _parse_json_map(raw: str) -> dict[str, Any]:
@@ -45,7 +46,7 @@ def keyword_boost(symbol: str, text: str, cfg: Settings | None = None) -> float:
     table = _parse_json_map(cfg.news_keyword_boost)
     if not table or not text:
         return 1.0
-    sym = (symbol or "").upper().replace("/USDT", "").replace(":USDT", "")
+    sym = normalize_symbol_key(symbol or "")
     buckets: list[dict] = []
     if sym in table and isinstance(table[sym], dict):
         buckets.append(table[sym])

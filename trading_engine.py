@@ -48,6 +48,7 @@ import pandas_ta as ta
 from config import settings
 from derivatives_filter import DerivativesSnapshot
 from logger import format_exception_detail, get_logger, log_exception
+from symbol_util import normalize_symbol_key
 
 log = get_logger(__name__)
 
@@ -189,6 +190,10 @@ class TradingEngine:
         if self._open_positions.pop(symbol, None) is not None:
             log.info("Position closed | %s | open_now=%d", symbol, self.position_count)
 
+    def tracked_symbols(self) -> list[str]:
+        """엔진이 슬롯을 점유 중인 심볼(진입 진행 중 포함)."""
+        return list(self._open_positions.keys())
+
     # ---- 지표 ----
     async def fetch_ohlcv_df(
         self,
@@ -281,16 +286,6 @@ class TradingEngine:
 
         return 0.0, first_err
 
-    async def fetch_mark_price(self, symbol: str) -> float | None:
-        """심볼의 현재 마크/체결 가격을 조회한다."""
-        try:
-            ticker = await self.exchange.fetch_ticker(symbol)
-            price = ticker.get("last") or ticker.get("close") or ticker.get("markPrice")
-            return float(price) if price is not None else None
-        except Exception as exc:  # noqa: BLE001
-            log_exception(log, exc, context="fetch_ticker", symbol=symbol)
-            return None
-
     async def fetch_open_positions(self) -> list[dict]:
         """거래소의 현재 오픈 포지션(수량 != 0)을 조회한다."""
         try:
@@ -302,19 +297,9 @@ class TradingEngine:
 
     async def get_position_contracts(self, symbol: str) -> tuple[Side | None, float]:
         """심볼의 거래소 잔여 수량 (contracts). 없으면 (None, 0)."""
-        def _norm(s: str) -> str:
-            return (
-                str(s).upper()
-                .replace(":USDT", "")
-                .replace("/USDT", "")
-                .replace("USDT", "")
-                .replace("/", "")
-                .strip()
-            )
-
-        target = _norm(symbol)
+        target = normalize_symbol_key(symbol)
         for p in await self.fetch_open_positions():
-            if _norm(str(p.get("symbol") or "")) != target:
+            if normalize_symbol_key(str(p.get("symbol") or "")) != target:
                 continue
             raw_side = (p.get("side") or "").lower()
             contracts = abs(float(p.get("contracts") or 0))
@@ -322,6 +307,22 @@ class TradingEngine:
                 continue
             return raw_side, contracts  # type: ignore[return-value]
         return None, 0.0
+
+    def _precise_amount(self, symbol: str, amount: float) -> float:
+        try:
+            return float(self.exchange.amount_to_precision(symbol, amount))
+        except Exception:  # noqa: BLE001
+            return round(amount, 6)
+
+    def _precise_price(self, symbol: str, price: float) -> float:
+        try:
+            return float(self.exchange.price_to_precision(symbol, price))
+        except Exception:  # noqa: BLE001
+            return price
+
+    @staticmethod
+    def _fill_price(order: dict, fallback: float = 0.0) -> float:
+        return float(order.get("average") or order.get("price") or fallback or 0.0)
 
     async def flatten_symbol(self, symbol: str) -> OrderResult | None:
         """해당 심볼 거래소 잔여 포지션을 시장가(reduceOnly)로 전량 청산."""
@@ -395,12 +396,8 @@ class TradingEngine:
             )
         order_side = "buy" if side == "long" else "sell"
         raw_amount = notional / limit_price
-        try:
-            amount = float(self.exchange.amount_to_precision(symbol, raw_amount))
-            price = float(self.exchange.price_to_precision(symbol, limit_price))
-        except Exception:  # noqa: BLE001
-            amount = round(raw_amount, 6)
-            price = limit_price
+        amount = self._precise_amount(symbol, raw_amount)
+        price = self._precise_price(symbol, limit_price)
         params = {"timeInForce": "GTC", "postOnly": True}
         try:
             order = await self.exchange.create_order(
@@ -416,7 +413,7 @@ class TradingEngine:
         filled = float(order.get("filled") or 0.0)
         status = (order.get("status") or "").lower()
         if filled > 0:
-            fill_price = float(order.get("average") or order.get("price") or price)
+            fill_price = self._fill_price(order, price)
             st = "filled" if filled >= amount else "partial"
             return OrderResult(
                 symbol, side, st, amount, filled, fill_price, order_id,
@@ -447,7 +444,7 @@ class TradingEngine:
         side: Side = "long" if side_raw == "buy" else "short"
         requested = float(order.get("amount") or 0.0)
         filled = float(order.get("filled") or 0.0)
-        price = float(order.get("average") or order.get("price") or 0.0)
+        price = self._fill_price(order)
         status = (order.get("status") or "").lower()
         if status == "closed" or (filled > 0 and filled >= requested):
             st = "filled"
@@ -588,12 +585,7 @@ class TradingEngine:
                 "Position opened | %s %s | filled=%.6f | open_now=%d",
                 symbol, side, result.filled_amount, self.position_count,
             )
-            if self.notifier is not None:
-                await self.notifier.send_trade(
-                    f"ENTRY {side.upper()}",
-                    symbol,
-                    f"filled={result.filled_amount} @ {result.price}",
-                )
+            # 텔레그램은 bot._open 이 거래소 실포지션 확인 후에만 보낸다.
         return result
 
     async def increase_position(
@@ -642,11 +634,7 @@ class TradingEngine:
         if ref <= 0:
             return OrderResult(symbol, side, "error", 0.0, 0.0, 0.0, reason="bad quote")
         order_side = "buy" if side == "long" else "sell"
-        raw_amount = notional_usdt / ref
-        try:
-            amount = float(self.exchange.amount_to_precision(symbol, raw_amount))
-        except Exception:  # noqa: BLE001
-            amount = round(raw_amount, 6)
+        amount = self._precise_amount(symbol, notional_usdt / ref)
         try:
             order = await self.exchange.create_order(
                 symbol, "market", order_side, amount, None, {},
@@ -658,7 +646,7 @@ class TradingEngine:
                 reason=f"{type(exc).__name__}: {exc}",
             )
         filled = float(order.get("filled") or 0.0)
-        fill_price = float(order.get("average") or order.get("price") or ref)
+        fill_price = self._fill_price(order, ref)
         if filled > 0:
             return OrderResult(
                 symbol, side, "filled", amount, filled, fill_price,
@@ -697,13 +685,8 @@ class TradingEngine:
             limit_price = best_bid * (1 - chase_bps / 10_000.0) if chase_bps else best_bid
 
         # 명목 가치(USDT)를 수량으로 환산하고 거래소 정밀도에 맞춰 반올림한다.
-        raw_amount = notional_usdt / limit_price
-        try:
-            amount = float(self.exchange.amount_to_precision(symbol, raw_amount))
-            price = float(self.exchange.price_to_precision(symbol, limit_price))
-        except Exception:  # noqa: BLE001 - 정밀도 헬퍼 실패 시 원값 사용
-            amount = round(raw_amount, 6)
-            price = limit_price
+        amount = self._precise_amount(symbol, notional_usdt / limit_price)
+        price = self._precise_price(symbol, limit_price)
 
         params = {"timeInForce": self.tif}
         log.info(
@@ -735,16 +718,19 @@ class TradingEngine:
         status = (order.get("status") or "").lower()
         filled = float(order.get("filled") or 0.0)
 
-        # 완전 체결.
-        if status == "closed" or filled >= requested > 0:
+        # 완전 체결 — status=closed 만으로는 불충분(미체결 취소도 closed 인 경우 있음).
+        if filled >= requested > 0:
             log.info("Order fully filled | %s | id=%s filled=%.6f", symbol, order_id, filled)
+            return OrderResult(symbol, side, "filled", requested, filled, price, order_id, "filled", order)
+        if status == "closed" and filled > 0:
+            log.info("Order closed with fill | %s | id=%s filled=%.6f", symbol, order_id, filled)
             return OrderResult(symbol, side, "filled", requested, filled, price, order_id, "filled", order)
 
         # 부분 체결: 일부만 체결되고 IOC로 나머지는 자동 취소됨.
         if 0 < filled < requested:
             reason = f"partial fill: {filled}/{requested} (remainder canceled by {self.tif})"
             log.warning("Order partially filled | %s | id=%s | %s", symbol, order_id, reason)
-            await self._cancel_if_open(symbol, order_id)
+            await self.cancel_order_safe(symbol, order_id)
             return OrderResult(symbol, side, "partial", requested, filled, price, order_id, reason, order)
 
         # 미체결: 사유를 구체적으로 로깅하고 즉시 취소 처리한다.
@@ -756,24 +742,10 @@ class TradingEngine:
             "ENTRY UNFILLED | symbol=%s side=%s id=%s price=%s amount=%s | %s",
             symbol, side, order_id, price, requested, reason,
         )
-        await self._cancel_if_open(symbol, order_id)
+        await self.cancel_order_safe(symbol, order_id)
         if self.notifier is not None:
             await self.notifier.send_error("entry_unfilled", f"{symbol} {side}: {reason}")
         return OrderResult(symbol, side, "unfilled", requested, 0.0, price, order_id, reason, order)
-
-    async def _cancel_if_open(self, symbol: str, order_id: str | None) -> None:
-        """주문이 아직 열려 있으면 즉시 취소한다(IOC/FOK는 보통 자동 취소됨)."""
-        if not order_id:
-            return
-        try:
-            await self.exchange.cancel_order(order_id, symbol)
-            log.info("Order canceled | symbol=%s id=%s", symbol, order_id)
-        except Exception as exc:  # noqa: BLE001 - 이미 취소/체결된 경우 정상
-            # OrderNotFound 등은 이미 종료된 주문이므로 디버그 수준으로 기록.
-            log.debug(
-                "Cancel skipped (already closed?) | symbol=%s id=%s | %s: %s",
-                symbol, order_id, type(exc).__name__, exc,
-            )
 
     # ---- 청산 ----
     async def close_position(
@@ -788,17 +760,12 @@ class TradingEngine:
     ) -> OrderResult:
         """오픈 포지션을 청산한다.
 
-        ``order_type='market'``  : 즉시 시장가 청산(고정 손절/트레일링 스톱용).
-        ``order_type='marketable_limit'`` : 호가를 가로지르는 지정가 청산(시간 청산용).
-        ``register_exit=False`` : 부분 익절 시 포지션 카운터를 유지한다.
-        ``verify_flat`` : 전량 청산 후 거래소 잔량(dust)이 있으면 시장가로 한 번 더 정리.
-
-        Long 포지션은 매도(sell)로, Short 포지션은 매수(buy)로 반대 방향 주문을
-        ``reduceOnly``로 제출한다.
+        ``order_type='market'``  : 즉시 시장가 청산.
+        ``order_type='marketable_limit'`` : 호가 가로지르기 지정가 청산.
+        ``register_exit=False`` : 부분 익절 시 포지션 카운터 유지.
+        ``verify_flat`` : 전량 청산 시 거래소 잔량 보정 + dust 재정리.
         """
         close_side = "sell" if side == "long" else "buy"
-        # 전량 청산 시 봇 추적 수량보다 거래소 잔량이 크면 거래소 수량으로 맞춤
-        # (부분익절·정밀도 반올림으로 dust 가 남는 케이스 방지).
         close_amount = float(amount)
         if register_exit and verify_flat:
             ex_side, ex_amt = await self.get_position_contracts(symbol)
@@ -810,34 +777,27 @@ class TradingEngine:
                 close_amount = ex_amt
 
         try:
+            amt = self._precise_amount(symbol, close_amount)
+            if amt <= 0:
+                raise RuntimeError(f"close amount rounds to 0 (raw={close_amount})")
             if order_type == "marketable_limit":
                 quote = await self._best_quote(symbol)
                 if quote is None:
                     raise RuntimeError("no order book for marketable-limit close")
                 best_bid, best_ask = quote
-                # 청산도 호가를 가로질러 즉시 체결을 노린다.
-                price = best_bid if close_side == "sell" else best_ask
-                price = float(self.exchange.price_to_precision(symbol, price))
-                amt = float(self.exchange.amount_to_precision(symbol, close_amount))
-                if amt <= 0:
-                    raise RuntimeError(
-                        f"close amount rounds to 0 (raw={close_amount})"
-                    )
+                price = self._precise_price(
+                    symbol, best_bid if close_side == "sell" else best_ask,
+                )
                 order = await self.exchange.create_order(
                     symbol, "limit", close_side, amt, price,
                     {"timeInForce": self.tif, "reduceOnly": True},
                 )
             else:
-                amt = float(self.exchange.amount_to_precision(symbol, close_amount))
-                if amt <= 0:
-                    raise RuntimeError(
-                        f"close amount rounds to 0 (raw={close_amount})"
-                    )
                 price = 0.0
                 order = await self.exchange.create_order(
                     symbol, "market", close_side, amt, None, {"reduceOnly": True},
                 )
-        except Exception as exc:  # noqa: BLE001 - 청산 실패는 표준 형식으로 기록
+        except Exception as exc:  # noqa: BLE001
             log_exception(
                 log, exc, context="close_order",
                 symbol=symbol, side=side, amount=close_amount, order_type=order_type,
@@ -848,8 +808,7 @@ class TradingEngine:
             )
 
         filled = float(order.get("filled") or 0.0)
-        fill_price = float(order.get("average") or order.get("price") or price or 0.0)
-        # 체결량이 비어 있으면 잔량 조회로 성공 여부 판정 (오판 filled=요청량 금지).
+        fill_price = self._fill_price(order, price)
         if filled <= 0 and register_exit and verify_flat:
             await asyncio.sleep(0.3)
             rem_side, rem_amt = await self.get_position_contracts(symbol)
@@ -870,14 +829,10 @@ class TradingEngine:
                 order.get("id"), "close unfilled", order,
             )
 
-        # 전량 청산 후 dust 잔량 정리 (정밀도 반올림으로 남는 소량).
         if register_exit and verify_flat:
             rem_side, rem_amt = await self.get_position_contracts(symbol)
             if rem_side == side and rem_amt > 0:
-                try:
-                    dust_amt = float(self.exchange.amount_to_precision(symbol, rem_amt))
-                except Exception:  # noqa: BLE001
-                    dust_amt = rem_amt
+                dust_amt = self._precise_amount(symbol, rem_amt)
                 if dust_amt > 0:
                     log.warning(
                         "Residual dust after close | %s %s rem=%.8f → market flatten",
@@ -888,14 +843,8 @@ class TradingEngine:
                             symbol, "market", close_side, dust_amt, None,
                             {"reduceOnly": True},
                         )
-                        dust_filled = float(dust_order.get("filled") or dust_amt)
-                        filled += dust_filled
-                        dust_px = float(
-                            dust_order.get("average")
-                            or dust_order.get("price")
-                            or fill_price
-                            or 0.0
-                        )
+                        filled += float(dust_order.get("filled") or dust_amt)
+                        dust_px = self._fill_price(dust_order, fill_price)
                         if dust_px > 0:
                             fill_price = dust_px
                     except Exception as exc:  # noqa: BLE001

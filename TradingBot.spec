@@ -34,6 +34,7 @@ LOCAL_MODULES = [
     "news_category.py",
     "trade_log.py",
     "pending_entry.py",
+    "symbol_util.py",
     "backtest/__init__.py",
     "backtest/engine.py",
     "backtest/ui.py",
